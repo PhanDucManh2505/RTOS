@@ -29,7 +29,7 @@
 #define A_GREEN    "\033[1;38;5;40m"     /* green lamps, up, CLEAR       */
 #define A_LAMP_RED "\033[38;5;160m"      /* a red lamp: normal, not news */
 #define A_BLUE     "\033[1;38;5;33m"
-#define A_MAGENTA  "\033[1;38;5;170m"    /* override, manual gates       */
+#define A_MAGENTA  "\033[1;38;5;170m"    /* override                     */
 #define A_CYAN     "\033[1;38;5;45m"     /* names: I1, X1                */
 #define A_WHITE    "\033[1;97m"
 #define A_GREY     "\033[38;5;245m"      /* secondary text               */

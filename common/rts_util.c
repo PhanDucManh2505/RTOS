@@ -230,15 +230,6 @@ int rts_timer_once(timer_t t, uint64_t ms)
     return timer_settime(t, 0, &its, NULL);
 }
 
-int rts_timer_at(timer_t t, uint64_t abs_ns)
-{
-    struct itimerspec its;
-    memset(&its, 0, sizeof(its));
-    its.it_value.tv_sec  = (time_t)(abs_ns / 1000000000ULL);
-    its.it_value.tv_nsec = (long)(abs_ns % 1000000000ULL);
-    return timer_settime(t, TIMER_ABSTIME, &its, NULL);
-}
-
 int rts_timer_every(timer_t t, uint64_t ms)
 {
     struct itimerspec its;

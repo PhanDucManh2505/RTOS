@@ -24,6 +24,10 @@
 #define T_PED_CLEAR_S       12.0
 #define T_PED_TOTAL_S       (T_WALK_S + T_PED_CLEAR_S)   /* 18 s */
 
+/* Off peak: how long a car given the green has to move off before the
+   green can go to the next request. */
+#define T_CAR_MOVE_S         5.0
+
 /* Green times per phase, and the cycle they add up to. */
 #define G_R1_S              20.0    /* phase A, R1 through            */
 #define G_RT1_S             13.0    /* phase B, R1 right turns        */
@@ -36,10 +40,6 @@
 #define G_MAX_S             60.0
 #define T_CYCLE_MAX_S      150.0
 
-/* Green wave. Two intersections either side of a crossing sit 12 s apart. */
-#define T_OFFSET_S          12.0
-#define T_OFFSET_FIX_MAX_S   3.0    /* most we bend one cycle to re-align */
-
 /* Railway pre-emption. */
 #define T_WARNING_S         30.0    /* notice the rail system must give   */
 #define T_RAIL_CLEAR_PEAK_S 21.0    /* green needed to empty 50 m of road */
@@ -48,9 +48,15 @@
 #define T_GATE_TIMEOUT_S     8.0    /* no movement by now means a fault    */
 #define T_TRAIN_OCCUPY_S    15.0    /* how long a train sits on the crossing */
 
-/* Trains. */
-#define T_TRAIN_PEAK_S     120.0    /* peak hour, one every 2 minutes  */
-#define T_TRAIN_NIGHT_S   1200.0    /* night, one every 20 minutes     */
+/* Trains. The line runs X1 - X2 - X3, north to south, on double track:
+   southbound (NS) trains enter at X1 on track A, northbound (SN) trains
+   enter at X3 on track B. A train is detected at the next crossing after
+   the time it takes to drive there, and that is the same in both
+   directions. */
+#define T_X1_X2_S           60.0    /* about 1.5 km at 90 km/h          */
+#define T_X2_X3_S           90.0    /* about 2.25 km at 90 km/h         */
+#define T_TRAIN_RUSH_S     120.0    /* rush hour, a train every 2 min   */
+#define T_TRAIN_OFFPEAK_S  240.0    /* off peak, a train every 4 min    */
 
 /* Links. */
 #define T_HEARTBEAT_S        1.0
@@ -58,10 +64,6 @@
 #define T_XING_REFRESH_S     1.0    /* railway repeats its state       */
 #define T_XING_WATCHDOG_S    3.0    /* silence for this long = FAULT   */
 #define T_SEND_TIMEOUT_MS  200      /* no MsgSend may block longer     */
-
-/* Sensor driven pattern. */
-#define G_SENSOR_MIN_S       8.0    /* shortest green when nobody waits */
-#define G_SENSOR_STEP_S      4.0    /* extension granted per vehicle    */
 
 /* Speed factor, set once at start up from -s or from RTS_SPEED. */
 void     rts_speed_set(double speed);

@@ -21,8 +21,7 @@ BIN      := bin
 OBJ      := obj
 
 COMMON_SRC := common/rts_proto.c  common/rts_names.c common/rts_util.c \
-              common/rts_log.c    common/rts_safety.c common/rts_shm.c \
-              common/rts_color.c
+              common/rts_log.c    common/rts_safety.c common/rts_color.c
 COMMON_OBJ := $(patsubst common/%.c,$(OBJ)/%.o,$(COMMON_SRC))
 
 CORE_OBJ   := $(OBJ)/intersection_core.o

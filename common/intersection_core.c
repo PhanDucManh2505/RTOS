@@ -5,7 +5,6 @@
 #include "rts_safety.h"
 #include "rts_color.h"
 #include "rts_log.h"
-#include "rts_shm.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -22,9 +21,10 @@
 #define PRIO_SRV     12
 #define PRIO_REPORT  10
 
-/* Chance, per lane per sensor sample, that a vehicle pulls up to a red
-   light. This stands in for real loop detectors; see t_phase(). */
-#define ARRIVE_PCT   10
+/* Random cars: about one car in this many seconds pulls up to one lane of
+   an intersection, picked at random. It stands in for real loop
+   detectors (see t_phase), and the control room can turn it off. */
+#define ARRIVE_EVERY_S  30
 
 /* ------------------------------------------------------------------ */
 /* All state shared by the threads of one controller.                  */
@@ -43,19 +43,21 @@ typedef struct {
     int      phase;
     int      state;
     uint8_t  green_mask;  /* movements a train held back during this green */
-    uint64_t state_end_ns;
-    uint32_t cycle_count;
-    uint64_t cycle_start_ns;
 
     /* pedestrians. The lamps are not kept here: a crossing always shows
        whatever the traffic beside it shows, so it is derived from the
-       phase. This is only the set of buttons still asking for a phase. */
+       phase. This is the set of buttons still asking for a phase and
+       when each was pressed. */
     uint8_t  ped_req;
+    uint64_t ped_ns[PD_COUNT];
+
+    /* Off peak, the green that is showing may not be given up before
+       this: 18 s once a pedestrian asked for it, 5 s once a car did. */
+    uint64_t hold_ns;
 
     /* pattern in force */
     int      pattern;
     uint16_t green_s[PH_COUNT];
-    double   offset_s;
 
     /* override from the control room */
     int      ov_active;
@@ -70,9 +72,12 @@ typedef struct {
     int      pre_pending;     /* 1 = pre-emption asked for, not done   */
     int      pre_done;        /* 1 = the clearing green has been given */
 
-    /* One loop detector per phase, and it says one thing: someone is
-       waiting on it, or nobody is. Used by the sensor driven pattern. */
-    uint8_t  car[PH_COUNT];
+    /* One loop detector per phase. 0 means nobody is on it, anything
+       else is when the car waiting there arrived. Used by the sensor
+       driven pattern; random_cars says whether cars also turn up on
+       their own. */
+    uint64_t car_ns[PH_COUNT];
+    int      random_cars;
 
     /* link to the control room */
     int      central_online;
@@ -82,8 +87,7 @@ typedef struct {
     int      status_dirty;
     uint32_t lamp_changes;
 
-    rts_chan_t      phase_ch;   /* private channel owned by t_phase */
-    rts_corridor_t *shm;
+    rts_chan_t phase_ch;   /* private channel owned by t_phase */
 } ictl_t;
 
 static ictl_t G;
@@ -268,10 +272,6 @@ static void lamps_commit(ictl_t *s, const char *note)
     s->status_dirty = 1;
     pthread_cond_signal(&s->report_cv);
 
-    rts_slot_write(s->shm, s->cfg->id, (uint8_t)s->phase, (uint8_t)s->state,
-                   (uint8_t)s->hold_rail, (uint8_t)s->pattern,
-                   s->cycle_count, s->cycle_start_ns);
-
     /* mv= is every vehicle lamp in the order they are printed on the
        screen, NS SN NW SE EW WE WS EN, so a log line says exactly which
        movements were released and which the train held back. */
@@ -302,7 +302,6 @@ static void fill_status(const ictl_t *s, inter_status_t *st)
     st->xing_state     = (uint8_t)s->xing_state;
     st->central_online = (uint8_t)s->central_online;
     st->override_active= (uint8_t)s->ov_active;
-    st->cycle_count    = s->cycle_count;
     memcpy(st->veh, s->veh, MV_COUNT);
     memcpy(st->ped, s->ped, PD_COUNT);
     for (i = 0; i < PH_COUNT; i++) {
@@ -317,25 +316,19 @@ static void fill_status(const ictl_t *s, inter_status_t *st)
 static timer_t tmr_phase;
 static timer_t tmr_sensor;
 
-static void fsm_enter(ictl_t *s, int newstate, const char *note);
-static void fsm_enter_at(ictl_t *s, int newstate, const char *note,
-                         uint64_t base);
-
 /*
  * How long the green that is about to start must run.
  *
  * FIXED and UPDATED : the programmed time, and the phase ends there.
  *
  * SENSOR : there is no programmed length at all. The green holds until
- *          another lane asks for it, so this is only the shortest it may
- *          be before such a request can be acted on - without it the
- *          lights would flip on every sensor sample. A pedestrian who
- *          asked for this phase gets the whole crossing time instead.
+ *          another phase is asked for, so this is only when to look
+ *          again: in a second, and every second after that.
  */
 static double green_seconds(ictl_t *s, int phase)
 {
     if (s->pattern == PAT_SENSOR) {
-        return ped_req_for(s, phase) ? T_PED_TOTAL_S : G_SENSOR_MIN_S;
+        return 1.0;
     }
     return (double)s->green_s[phase];
 }
@@ -356,41 +349,115 @@ static void status_now(ictl_t *s)
 }
 
 /*
- * Off peak the lights do not run a cycle at all: they sit where they
- * are until something asks them to move. This answers "who is asking",
- * or -1 for "nobody, stay put".
+ * Off peak the lights do not run a cycle at all: they sit on one phase
+ * until another phase is asked for. This answers who is next, or -1 for
+ * nobody. Any phase can be next, not only the one after this one.
  *
- * A pedestrian asks outright and is granted the phase straight away,
- * because a person waiting at a kerb is not detected again later and
- * would otherwise wait for a gap that never comes.
- *
- * A vehicle is only granted its request once the lane that is green has
- * emptied, so a single car at a side road cannot cut off a road that
- * still has traffic on it. That is the whole rule.
- *
- * Phases are scanned starting from the one after the current phase, so
- * when two lanes ask at once they are still served in A B C D order.
+ * Pedestrians come first, the button pressed earliest; after them the
+ * vehicles, the car that reached its loop earliest. A phase a train has
+ * taken every movement from cannot be given, so its request waits.
  */
-static int sensor_want_phase(const ictl_t *s, uint8_t blocked)
+static int sensor_pick(const ictl_t *s, uint8_t blocked)
 {
-    int i, p;
+    uint64_t first = 0;
+    int      best  = -1;
+    int      p, d;
 
-    for (i = 1; i < PH_COUNT; i++) {
-        p = (s->phase + i) % PH_COUNT;
-        if ((rts_phase_mask(p) & ~blocked) == 0) continue;
-        if (s->ped_req & ped_mask(p))            return p;
+    for (d = 0; d < PD_COUNT; d++) {
+        p = rts_ped_phase(d);
+        if (!(s->ped_req & (1u << d)) || p < 0 || p == s->phase ||
+            (rts_phase_mask(p) & ~blocked) == 0) {
+            continue;
+        }
+        if (best < 0 || s->ped_ns[d] < first) {
+            best  = p;
+            first = s->ped_ns[d];
+        }
     }
+    if (best >= 0) {
+        return best;
+    }
+    for (p = 0; p < PH_COUNT; p++) {
+        if (s->car_ns[p] == 0 || p == s->phase ||
+            (rts_phase_mask(p) & ~blocked) == 0) {
+            continue;
+        }
+        if (best < 0 || s->car_ns[p] < first) {
+            best  = p;
+            first = s->car_ns[p];
+        }
+    }
+    return best;
+}
 
-    if (s->car[s->phase]) {
-        return -1;            /* our own lane still has someone on it */
-    }
+/*
+ * May the green that is showing be given up to a request? Not inside the
+ * time owed to whoever asked for it: 18 s for a pedestrian to cross, 5 s
+ * for a car to move off.
+ */
+static int sensor_may_leave(const ictl_t *s)
+{
+    return rts_now_ns() >= s->hold_ns;
+}
 
-    for (i = 1; i < PH_COUNT; i++) {
-        p = (s->phase + i) % PH_COUNT;
-        if ((rts_phase_mask(p) & ~blocked) == 0) continue;
-        if (s->car[p])                           return p;
+/* Owe the green that is showing at least 'secs' from now, and never less
+   than it is owed already. */
+static void hold_green(ictl_t *s, double secs)
+{
+    uint64_t until = rts_now_ns() + rts_ns(secs);
+
+    if (until > s->hold_ns) {
+        s->hold_ns = until;
     }
-    return -1;
+}
+
+/* Does an override want a phase other than the one that is green? */
+static int override_elsewhere(const ictl_t *s)
+{
+    return s->ov_active && rts_now_ns() < s->ov_until_ns &&
+           s->ov_phase != s->phase &&
+           (rts_phase_mask(s->ov_phase) & ~rail_block(s)) != 0;
+}
+
+/*
+ * A car reaches the loop of a phase. If that phase is green it drives on,
+ * and gets its 5 s to move off before the green can be given up.
+ * Otherwise it waits; a car already waiting there keeps its place, so the
+ * earliest arrival is the one that counts. Caller holds s->lk.
+ */
+static void car_arrives(ictl_t *s, int phase, const char *who)
+{
+    if (s->state == ST_GREEN && phase == s->phase) {
+        hold_green(s, T_CAR_MOVE_S);
+        rts_log("%s car on green phase %s (%s)", s->cfg->label,
+                rts_phase_name((uint8_t)phase), who);
+        return;
+    }
+    if (s->car_ns[phase] == 0) {
+        s->car_ns[phase] = rts_now_ns();
+        rts_log("%s car waiting for phase %s (%s)", s->cfg->label,
+                rts_phase_name((uint8_t)phase), who);
+    }
+}
+
+/*
+ * A pedestrian button. If the traffic beside that crossing is already
+ * green they walk straight away, so there is nothing to wait for: the
+ * press only buys them 18 s before the green can be given up. Otherwise
+ * it waits for its phase like a car, but ahead of every car.
+ * Caller holds s->lk.
+ */
+static void ped_press(ictl_t *s, int ped)
+{
+    rts_log("%s pedestrian button %d pressed", s->cfg->label, ped);
+    if (s->state == ST_GREEN && rts_ped_phase(ped) == s->phase) {
+        hold_green(s, T_PED_TOTAL_S);
+        return;
+    }
+    if (!(s->ped_req & (1u << ped))) {
+        s->ped_req    |= (uint8_t)(1u << ped);
+        s->ped_ns[ped] = rts_now_ns();
+    }
 }
 
 /*
@@ -417,9 +484,11 @@ static int next_phase(ictl_t *s)
     }
 
     if (s->pattern == PAT_SENSOR) {
-        p = sensor_want_phase(s, blocked);
-        if (p >= 0) {
-            return p;
+        /* The green was given up because someone asked, so give it to
+           them; the time owed to the old green was settled before. */
+        int want = sensor_pick(s, blocked);
+        if (want >= 0) {
+            return want;
         }
         /* Nobody asked, so stay where we are - unless a train has taken
            every movement this phase owns, in which case fall through to
@@ -452,79 +521,19 @@ static int next_phase(ictl_t *s)
 }
 
 /*
- * The green wave. At the start of each cycle we look at when our
- * partner across the crossing started its own cycle and bend this
- * cycle by at most a few seconds to hold the designed offset.
- */
-static double offset_correction(ictl_t *s)
-{
-    rts_slot_t pair;
-    double     cycle_ms, want_ms, have_ms, err_ms, fix_s;
-
-    if (s->pattern == PAT_SENSOR || s->cfg->pair_id <= 0) {
-        return 0.0;   /* only meaningful when both run a fixed cycle */
-    }
-    /* The lower-numbered controller of a pair leads and keeps its
-       programmed timing; only its partner bends. When both bent, each
-       chased the other and the pair never settled: phase A ran 17 or
-       23 s instead of 20 s and the offset never reached 12 s. */
-    if (s->cfg->id < s->cfg->pair_id) {
-        return 0.0;
-    }
-    if (rts_slot_read(s->shm, s->cfg->pair_id, &pair) != 0) {
-        return 0.0;   /* partner not running, nothing to align to */
-    }
-    /* Only line up with a partner running the same cycle, and never
-       while a train is holding either side. */
-    if (pair.pattern != (uint8_t)s->pattern || pair.train_hold || s->hold_rail) {
-        return 0.0;
-    }
-
-    cycle_ms = (double)rts_ms(T_CYCLE_S);
-    want_ms  = (double)rts_ms(s->offset_s);
-    have_ms  = (double)((int64_t)s->cycle_start_ns -
-                        (int64_t)pair.cycle_start_ns) / 1e6;
-
-    /* Fold into one cycle so the answer is the shortest correction. */
-    while (have_ms < 0)         have_ms += cycle_ms;
-    while (have_ms >= cycle_ms) have_ms -= cycle_ms;
-
-    err_ms = want_ms - have_ms;
-    if (err_ms >  cycle_ms / 2.0) err_ms -= cycle_ms;
-    if (err_ms < -cycle_ms / 2.0) err_ms += cycle_ms;
-
-    fix_s = (err_ms / 1000.0) * rts_speed();
-    if (fix_s >  T_OFFSET_FIX_MAX_S) fix_s =  T_OFFSET_FIX_MAX_S;
-    if (fix_s < -T_OFFSET_FIX_MAX_S) fix_s = -T_OFFSET_FIX_MAX_S;
-    return fix_s;
-}
-
-/*
  * Enter a new state: set the lamps, arm the timer, publish.
  *
- * base is when the state was planned to start: the planned end of the
- * state before it when a timer ended that one, or now when an event cut
- * in. An ordinary green ends on that plan, so the few milliseconds
- * every timer runs late do not add up into a cycle that drifts.
- *
- * Every interval that exists for safety - amber, all-red, start-up and
- * the clearing green - is timed from the moment the lamps actually
- * changed instead, so a late timer can only ever make one longer.
+ * Every state is timed from the moment its lamps change. A timer that
+ * fires a little late makes that one state a little longer, never
+ * shorter. Each intersection runs on its own, so nothing has to stay in
+ * step with anything else.
  */
-static void fsm_enter_at(ictl_t *s, int newstate, const char *note,
-                         uint64_t base)
+static void fsm_enter(ictl_t *s, int newstate, const char *note)
 {
-    double   secs;
-    uint64_t now     = rts_now_ns();
-    uint8_t  blocked = rail_block(s);
-    int      exit_mv;
+    double  secs;
+    uint8_t blocked = rail_block(s);
+    int     exit_mv;
 
-    /* More than half a second behind the plan is not timer delay but
-       an event (an override, or an off peak green with nobody asking
-       for a change, kept the last phase), so start the plan from now. */
-    if (now > base + rts_ns(0.5)) {
-        base = now;
-    }
     s->state = newstate;
 
     switch (newstate) {
@@ -539,15 +548,22 @@ static void fsm_enter_at(ictl_t *s, int newstate, const char *note,
         s->green_mask = blocked;
         rts_lamps_phase_masked(s->veh, s->phase, LAMP_GREEN, blocked);
         secs = green_seconds(s, s->phase);
-        if (s->phase == PH_A) {
-            secs += offset_correction(s);
-            if (secs < G_MIN_S) secs = G_MIN_S;
-        }
         /* The crossings beside this phase walk with it, in every
            pattern. Anyone who pressed a button for one of them has now
-           got what they asked for, so the request is cleared here. */
+           got what they asked for, so the request is cleared here. The
+           car waiting on this phase drives on. Off peak whoever asked is
+           owed part of this green: 18 s for a pedestrian, 5 s for the car
+           to move off. */
         ped_set(s, s->phase, PED_WALK);
+        if (ped_req_for(s, s->phase)) {
+            s->hold_ns = rts_now_ns() + rts_ns(T_PED_TOTAL_S);
+        } else if (s->car_ns[s->phase] != 0) {
+            s->hold_ns = rts_now_ns() + rts_ns(T_CAR_MOVE_S);
+        } else {
+            s->hold_ns = 0;
+        }
         s->ped_req &= (uint8_t)~ped_mask(s->phase);
+        s->car_ns[s->phase] = 0;
         break;
 
     case ST_AMBER:
@@ -593,43 +609,25 @@ static void fsm_enter_at(ictl_t *s, int newstate, const char *note,
         break;
     }
 
-    /* state_end_ns stays on the plan whichever way this state is timed,
-       so the state after it still starts where the plan said it would
-       and only the ordinary greens absorb the delay. */
-    s->state_end_ns = base + rts_ns(secs);
-    if (newstate == ST_GREEN) {
-        rts_timer_at(tmr_phase, s->state_end_ns);
-    } else {
-        rts_timer_at(tmr_phase, now + rts_ns(secs));
-    }
+    rts_timer_once(tmr_phase, rts_ms(secs));
     lamps_commit(s, note);
-}
-
-/* An event changed the state: time it from now. */
-static void fsm_enter(ictl_t *s, int newstate, const char *note)
-{
-    fsm_enter_at(s, newstate, note, rts_now_ns());
 }
 
 /* Keep the current green one more second, then look again. */
 static void extend_green(ictl_t *s)
 {
-    s->state_end_ns = rts_now_ns() + rts_ns(1.0);
-    rts_timer_at(tmr_phase, s->state_end_ns);
+    rts_timer_once(tmr_phase, rts_ms(1.0));
 }
 
-/* A phase timer expired: decide what comes next. Every state entered
-   from here starts where the plan said the last one would end. */
+/* A phase timer expired: decide what comes next. */
 static void fsm_advance(ictl_t *s)
 {
-    char     note[64];
-    uint64_t plan = s->state_end_ns;
+    char note[64];
 
     switch (s->state) {
     case ST_STARTUP:
-        s->phase          = PH_A;
-        s->cycle_start_ns = plan;
-        fsm_enter_at(s, ST_GREEN, "cycle start", plan);
+        s->phase = PH_A;
+        fsm_enter(s, ST_GREEN, "cycle start");
         break;
 
     case ST_GREEN:
@@ -640,24 +638,35 @@ static void fsm_advance(ictl_t *s)
             extend_green(s);
             return;
         }
-        /* Off peak the minimum is up, but the phase does not end on a
-           clock: it holds until another lane asks for it. Look again in
-           a second, and again after that, for as long as it takes. */
-        if (s->pattern == PAT_SENSOR &&
-            sensor_want_phase(s, rail_block(s)) < 0) {
-            extend_green(s);
+        /* Off peak the phase does not end on a clock. It is given up
+           when another phase has asked for it and whoever asked for this
+           one has had their time, 18 s for a pedestrian and 5 s for a
+           car - or when an override wants a different phase. Otherwise
+           look again in a second, and again after that, for as long as
+           it takes. */
+        if (s->pattern == PAT_SENSOR && !override_elsewhere(s)) {
+            int want = sensor_may_leave(s) ? sensor_pick(s, rail_block(s))
+                                           : -1;
+            if (want < 0) {
+                extend_green(s);
+                return;
+            }
+            snprintf(note, sizeof(note), "SENSOR: %s asked for phase %s",
+                     ped_req_for(s, want) ? "a pedestrian" : "a car",
+                     rts_phase_name((uint8_t)want));
+            fsm_enter(s, ST_AMBER, note);
             return;
         }
-        fsm_enter_at(s, ST_AMBER, NULL, plan);
+        fsm_enter(s, ST_AMBER, NULL);
         break;
 
     case ST_AMBER:
-        fsm_enter_at(s, ST_ALLRED, NULL, plan);
+        fsm_enter(s, ST_ALLRED, NULL);
         break;
 
     case ST_PRE_CLEAR:
         s->pre_done = 1;
-        fsm_enter_at(s, ST_AMBER, "tracks cleared", plan);
+        fsm_enter(s, ST_AMBER, "tracks cleared");
         break;
 
     case ST_ALLRED:
@@ -669,7 +678,7 @@ static void fsm_advance(ictl_t *s)
                ask for a second pre-emption during this clearing green,
                and that stale request ran a second clearing green after
                the train had already gone. */
-            fsm_enter_at(s, ST_PRE_CLEAR, "RAIL: clearing the tracks", plan);
+            fsm_enter(s, ST_PRE_CLEAR, "RAIL: clearing the tracks");
             return;
         }
         if (s->pre_done) {
@@ -677,25 +686,15 @@ static void fsm_advance(ictl_t *s)
             s->pre_pending = 0;
             if (xing_wants_hold(s)) {
                 s->hold_rail = 1;
-                snprintf(note, sizeof(note), "RAIL: holding, road over tracks red");
-                s->phase          = PH_A;
-                s->cycle_count++;
-                s->cycle_start_ns = plan;
-                fsm_enter_at(s, ST_GREEN, note, plan);
+                s->phase     = PH_A;
+                fsm_enter(s, ST_GREEN, "RAIL: holding, road over tracks red");
                 return;
             }
             /* The crossing cleared while the tracks were being emptied,
                so there is nothing to hold: carry on with the cycle. */
         }
-        {
-            int np = next_phase(s);
-            if (np <= s->phase) {           /* wrapped: a cycle finished */
-                s->cycle_count++;
-                s->cycle_start_ns = plan;
-            }
-            s->phase = np;
-            fsm_enter_at(s, ST_GREEN, NULL, plan);
-        }
+        s->phase = next_phase(s);
+        fsm_enter(s, ST_GREEN, NULL);
         break;
 
     default:
@@ -748,7 +747,6 @@ static void *t_phase(void *arg)
     ictl_t   *s = (ictl_t *)arg;
     rts_rcv_t rcv;
     int       rcvid;
-    int       i;
 
     rts_timer_new(&tmr_phase,  &s->phase_ch, PRIO_PHASE, PULSE_PHASE_TICK,  0);
     rts_timer_new(&tmr_sensor, &s->phase_ch, PRIO_PHASE, PULSE_SENSOR_TICK, 0);
@@ -782,31 +780,18 @@ static void *t_phase(void *arg)
         case PULSE_SENSOR_TICK:
             /*
              * Stand in for the loop detectors the real intersection
-             * would have. Each lane reads one bit: someone is waiting
-             * on it, or nobody is.
+             * would have, one per phase: a car is waiting on it or not,
+             * and since when. A car drives on as soon as its phase is
+             * green (see car_arrives and fsm_enter), so only a red lane
+             * ever holds one.
              *
-             * The green lane empties first, because whatever was on the
-             * loop has driven through. Then every lane, that one
-             * included, may pick up a new arrival - so a road that is
-             * genuinely busy still reads occupied and goes on holding
-             * its own green, which is what makes the "switch only when
-             * the green lane is clear" rule mean anything.
-             *
-             * A lane at a red light is never cleared here: the car
-             * stays on the loop until its phase is given the green.
-             *
-             * ARRIVE_PCT is the only tunable. Set it to 0 and the
-             * lights freeze where they are until someone presses a
-             * pedestrian button, which is the clearest way to see that
-             * the off peak green really has no clock on it.
+             * With random cars on, about one car every ARRIVE_EVERY_S
+             * seconds pulls up at a lane picked at random, so a quiet
+             * intersection still changes now and then. The control room
+             * can turn that off and place cars by hand instead.
              */
-            for (i = 0; i < PH_COUNT; i++) {
-                if (i == s->phase && s->state == ST_GREEN) {
-                    s->car[i] = 0;
-                }
-                if ((rand() % 100) < ARRIVE_PCT) {
-                    s->car[i] = 1;
-                }
+            if (s->random_cars && rand() % ARRIVE_EVERY_S == 0) {
+                car_arrives(s, rand() % PH_COUNT, "random");
             }
             /* The link is judged by silence, not by a failed send. */
             if (s->central_online &&
@@ -828,6 +813,7 @@ static void *t_phase(void *arg)
                 rts_log("%s crossing unreadable, treating as FAULT",
                         s->cfg->label);
                 s->xing_state = XS_FAULT;
+                status_now(s);
             }
             /*
              * Re-check once a second as well as on every event. Events
@@ -899,6 +885,11 @@ static void *t_preempt(void *arg)
             s->xing_state    = rcv.msg.u.xing.state;
             s->xing_last_ns  = rts_now_ns();
             s->xing_seen     = 1;
+            if (changed) {
+                /* The control room shows our view of the crossing, and
+                   WARNING -> CLOSED changes no lamp, so send it now. */
+                status_now(s);
+            }
             pthread_mutex_unlock(&s->lk);
 
             /* Reply first, act second: the railway node must never be
@@ -1012,6 +1003,12 @@ static void *t_srv(void *arg)
 
         case MSG_HEARTBEAT:
             s->last_hb_ns = rts_now_ns();
+            /* The random cars switch rides on every heartbeat. */
+            if (s->random_cars != rcv.msg.u.heartbeat.random_cars) {
+                s->random_cars = rcv.msg.u.heartbeat.random_cars;
+                rts_log("%s random cars %s", s->cfg->label,
+                        s->random_cars ? "on" : "off");
+            }
             if (!s->central_online) {
                 s->central_online = 1;
                 rts_log("%s central controller back online, sending full "
@@ -1044,9 +1041,6 @@ static void *t_srv(void *arg)
                            earlier UPDATED pattern stayed in force. */
                         s->green_s[i] = default_green(i);
                     }
-                }
-                if (rcv.msg.u.set_pattern.offset_s != 0) {
-                    s->offset_s = rcv.msg.u.set_pattern.offset_s;
                 }
                 rts_log("%s accepted pattern %s (applies at end of cycle)",
                         s->cfg->label, rts_pattern_name((uint8_t)s->pattern));
@@ -1093,17 +1087,21 @@ static void *t_srv(void *arg)
 
         case MSG_PED_BUTTON:
             if (rcv.msg.u.button.ped_id < PD_COUNT) {
-                s->ped_req |= (uint8_t)(1u << rcv.msg.u.button.ped_id);
-                rts_log("%s pedestrian button %d pressed",
-                        s->cfg->label, rcv.msg.u.button.ped_id);
+                ped_press(s, rcv.msg.u.button.ped_id);
                 wake = 1;
             } else {
                 rep.result = -1;
             }
             break;
 
-        case MSG_QUERY_STATE:
-            fill_status(s, &rep.status);
+        case MSG_CAR_REQUEST:
+            if (rcv.msg.u.car.phase < PH_COUNT) {
+                car_arrives(s, rcv.msg.u.car.phase, "operator");
+                wake = 1;
+            } else {
+                rep.result = -1;
+                rep.reason = REJ_BAD_PHASE;
+            }
             break;
 
         default:
@@ -1191,30 +1189,24 @@ int intersection_run(const inter_cfg_t *cfg, int argc, char **argv)
     /* Sensible defaults so the intersection is safe and useful before
        the control room has ever spoken to it. */
     G.pattern    = PAT_SENSOR;
-    G.offset_s   = cfg->offset_s;
     G.xing_state = XS_FAULT;   /* until proven otherwise, assume the worst */
     G.hold_rail  = 1;          /* so the tracks are never crossed on trust */
     G.state      = ST_STARTUP;
     G.phase      = PH_A;
+    G.random_cars = 1;         /* until the control room says otherwise */
     for (i = 0; i < PH_COUNT; i++) {
         G.green_s[i] = default_green(i);
     }
     rts_lamps_all_red(G.veh, G.ped);
     srand((unsigned)(cfg->id * 7919));
 
-    G.shm = rts_shm_open();
-    if (G.shm == NULL) {
-        say(cfg->label, A_AMBER, "shared memory unavailable, green wave "
-            "disabled");
-    }
-
     if (rts_chan_open(&G.phase_ch) != 0) {
         say(cfg->label, A_RED, "cannot create the phase channel");
         return 1;
     }
 
-    say(cfg->label, "", "crossing %d on the %s arm, partner I%d, offset %.0f s",
-        cfg->xing_id, rts_arm_name(cfg->rail_arm), cfg->pair_id, cfg->offset_s);
+    say(cfg->label, "", "crossing %d on the %s arm",
+        cfg->xing_id, rts_arm_name(cfg->rail_arm));
 
     rts_thread(&th_pre,   t_preempt, &G, PRIO_PREEMPT);
     rts_thread(&th_phase, t_phase,   &G, PRIO_PHASE);
@@ -1230,6 +1222,5 @@ int intersection_run(const inter_cfg_t *cfg, int argc, char **argv)
     rts_log("=== %s stopped ===", procname);
     rts_log_stop();
     rts_chan_close(&G.phase_ch);
-    rts_shm_close(G.shm);
     return 0;
 }

@@ -8,7 +8,7 @@ as plain text, so this script can press keys and read the screens.
 
     python rts_validate.py [group ...]      groups: g1 .. g8, default all
 """
-import json, os, re, statistics as stats, subprocess, sys, time
+import json, os, re, shlex, statistics as stats, subprocess, sys, time
 
 VM1 = "root@192.168.56.110"
 SPEED = float(os.environ.get("RTS_SPEED", "5"))
@@ -36,7 +36,8 @@ def H(args, timeout=120):
     return ssh("/tmp/manh/rtst.sh " + args, timeout)
 
 def key(win, k):
-    H(f"key {win} {k}")
+    # Quoted, so keys the shell would read (# $ ! and so on) arrive as typed.
+    H(f"key {win} {shlex.quote(k)}")
 
 def real(design_s):
     return design_s / SPEED
@@ -75,14 +76,25 @@ def last_frame(txt, marker, n):
     return None
 
 def parse_central(txt):
-    L = last_frame(txt, " CENTRAL CONTROL ROOM", 22)
+    L = last_frame(txt, " CENTRAL CONTROL ROOM", 23)
     if not L:
         return None
     f = {"title": L[0], "rail": "DOWN" if "railway DOWN" in L[0] else "up",
-         "I": {}, "X": {}, "msg": L[16].strip(), "target": ""}
-    tt = L[18].split()
+         "I": {}, "X": {}, "msg": L[16].strip(), "target": "", "draft": None}
+    tt = L[17].split()
     if len(tt) > 1 and tt[0] == "TARGET":
         f["target"] = tt[1]
+    # The UPDATED row: the four green times u will send, and the phase
+    # that - and + change, marked >like this<.
+    dr = re.findall(r"\b([ABCD]) ([> ])\s*(\d+)", L[19]) if L[19].strip().startswith("UPDATED") else []
+    if len(dr) == 4:
+        f["draft"] = ([int(v) for _, _, v in dr], "".join(p for p, m, _ in dr if m == ">"))
+    # The SENSOR row ends with the random cars switch.
+    rc = re.search(r"random cars (ON|OFF)", L[21])
+    f["random"] = rc.group(1) if rc else None
+    # The RAILWAY row ends with whether the control room has the trains stopped.
+    ln = re.search(r"trains (STOPPED|running)", L[22])
+    f["line"] = ln.group(1) if ln else None
     for k in range(6):
         tok = L[3 + k].split()
         if not tok:
@@ -91,8 +103,12 @@ def parse_central(txt):
         if len(tok) > 1 and tok[1] == "----":
             f["I"][k + 1] = {"sel": sel, "waiting": True}
             continue
+        # An UPDATED intersection shows the green times it runs, A/B/C/D.
+        gr = re.fullmatch(r"(\d+)/(\d+)/(\d+)/(\d+)", tok[18])
         f["I"][k + 1] = {"sel": sel, "waiting": False, "link": tok[1], "ph": tok[2], "st": tok[3],
-                         "lamps": tok[4:12], "ped": tok[12:16], "xs": tok[17], "pat": tok[18],
+                         "lamps": tok[4:12], "ped": tok[12:16], "xs": tok[17],
+                         "pat": "UPDATED" if gr else tok[18],
+                         "greens": [int(v) for v in gr.groups()] if gr else None,
                          "hold": "RAIL" in tok[19:]}
     for k in range(3):
         tok = L[12 + k].split()
@@ -101,24 +117,26 @@ def parse_central(txt):
             continue
         f["X"][k + 1] = {"online": True, "sel": tok[0].startswith(">"), "state": tok[1],
                          "gates": tok[2], "tracks": tok[3] + tok[4], "signal": tok[5],
-                         "mode": tok[6], "trains": int(tok[7])}
+                         "trains": int(tok[6])}
     return f
 
 def central():
     return parse_central(H("frame c"))
 
 def railway():
-    L = last_frame(H("frame r"), " RAILWAY CONTROLLER", 20)
+    L = last_frame(H("frame r"), " RAILWAY CONTROLLER", 22)
     if not L:
         return None
-    f = {"title": L[0], "auto": "AUTO" in L[0], "night": "NIGHT" in L[0], "X": {}, "events": []}
+    tt = re.search(r"trains (\S+)", L[0])
+    f = {"title": L[0], "timetable": tt.group(1) if tt else None, "next": L[7].strip(),
+         "X": {}, "events": []}
     for k in range(3):
         tok = L[3 + k].split()
         f["X"][k + 1] = {"sel": tok[0].startswith(">"), "state": tok[1], "gates": tok[2],
                          "tracks": tok[3] + tok[4], "signal": tok[5], "fault": tok[6],
-                         "mode": tok[7], "trains": int(tok[8])}
+                         "trains": int(tok[7])}
     for k in range(6):
-        s = L[9 + k].strip()
+        s = L[10 + k].strip()
         if s and s != "nothing yet":
             f["events"].append(s)
     return f
@@ -216,41 +234,6 @@ def logs(save_as=None):
         if cur is not None and line.strip():
             cur.append(line)
     return {k: Log(v) for k, v in out.items()}
-
-SLOT0, SLOTSZ = 8, 32      # rts_corridor_t: magic, pad, then six slots
-
-
-def corridor():
-    """The VM2 corridor region: what each controller published about its
-    own cycle, on the one clock all six of them share."""
-    raw = H("shm")
-    b = bytes(int(x) for x in raw.split())
-    if len(b) < SLOT0 + 6 * SLOTSZ:
-        return {}
-    out = {}
-    for i in range(6):
-        o = SLOT0 + i * SLOTSZ
-        if b[o + 4] != 1:
-            continue           # this controller never started
-        out[i + 1] = {
-            "phase": b[o + 5], "state": b[o + 6], "train_hold": b[o + 7],
-            "pattern": b[o + 8],
-            "cycle_count": int.from_bytes(b[o + 12:o + 16], "little"),
-            "cycle_start_ns": int.from_bytes(b[o + 16:o + 24], "little"),
-            "updated_ns": int.from_bytes(b[o + 24:o + 32], "little"),
-        }
-    return out
-
-
-def pair_lag_s(c, a, b, cycle_design_s=90.0):
-    """Design seconds between the cycle starts of a pair, folded into one
-    cycle. None when either side has not published."""
-    if a not in c or b not in c:
-        return None
-    cycle_ns = cycle_design_s / SPEED * 1e9
-    d = (c[b]["cycle_start_ns"] - c[a]["cycle_start_ns"]) % cycle_ns
-    return round(d / 1e9 * SPEED, 3)
-
 
 def intervals(ev):
     """Each lamp state from its first commit to the next different state.

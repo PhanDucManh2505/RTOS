@@ -1,8 +1,8 @@
 /*
  * intersection_core.h - the local controller.
  *
- * All six intersections behave identically; only their identity, the
- * crossing they sit next to, and their green wave offset differ. So the
+ * All six intersections behave identically and independently; only their
+ * identity and the crossing they sit next to differ. So the
  * behaviour lives here once and each intersection_iN.c is a short main()
  * that fills in a config and calls intersection_run(). Every one of the
  * six still builds into its own separate executable and runs as its own
@@ -46,13 +46,11 @@ typedef struct {
     int         id;          /* 1 .. 6                                  */
     uint16_t    sender_id;   /* SND_I1 .. SND_I6                        */
     int         xing_id;     /* 1 .. 3, the crossing on this road       */
-    int         pair_id;     /* the intersection on the other side of it */
     int         rail_arm;    /* arm_t: the arm the tracks cross. The
                                 crossing sits between the two controllers
                                 of a pair, so it is on opposite sides of
                                 them. Movements that end in this arm are
                                 the ones a train forbids.               */
-    double      offset_s;    /* green wave offset behind the pair        */
     const char *label;       /* "I1"                                     */
 } inter_cfg_t;
 

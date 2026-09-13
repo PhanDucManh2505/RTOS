@@ -1,10 +1,14 @@
 /*
  * central.c - the central controller. Runs alone on VM1.
  *
- * It monitors the whole network and issues pattern, override and gate
+ * It monitors the whole network and issues pattern and override
  * commands. It never drives a lamp itself: that is always done by the
  * local controller, and it keeps working whether this process is
  * running or not.
+ *
+ * Nor does it drive a train or a gate. It can only tell the railway to
+ * stop every train, or let them run again, and it acknowledges every
+ * gate fault the railway reports.
  *
  * Threads, highest priority first:
  *   prio 12  t_srv       receives status from the six intersections and
@@ -63,6 +67,21 @@ static uint64_t        g_rail_last_ns;
 
 static int             g_selected = 1;      /* 0 = all six */
 
+/* The green times u sends with the UPDATED pattern, one per phase, and
+   the phase that - and + change. They start at the programmed times and
+   stay as the operator leaves them. t_op writes them and t_display only
+   reads them, the same as g_selected. */
+#define DRAFT_MAX_S 99
+static int             g_draft[PH_COUNT] = {
+    (int)G_R1_S, (int)G_RT1_S, (int)G_R3_S, (int)G_RT3_S
+};
+static int             g_draft_ph = PH_A;
+
+/* Random cars at the intersections, on or off. It rides on every
+   heartbeat, so all six follow it within a second and a controller that
+   restarts picks it up again. t_op writes it, t_hb and t_display read it. */
+static int             g_random = 1;
+
 /* The one-line message under the tables. It has its own lock because
    t_op sets it without holding g_lk, while t_srv and t_hb set it with
    g_lk held: the order is always g_lk first, then g_flash_lk. */
@@ -92,6 +111,25 @@ static void flash(const char *color, const char *fmt, ...)
     g_flash_color = color;
     g_flash_ns    = rts_now_ns();
     pthread_mutex_unlock(&g_flash_lk);
+}
+
+/* One command to the railway on 'link', which must belong to the calling
+   thread. Returns 0 accepted, 1 refused, -1 no answer. */
+static int rail_send(rts_link_t *link, int action, int xing_id)
+{
+    rts_msg_t   m;
+    rts_reply_t rep;
+
+    memset(&m, 0, sizeof(m));
+    m.hdr.type           = MSG_RAIL_CMD;
+    m.hdr.sender         = SND_CENTRAL;
+    m.u.rail_cmd.action  = (uint8_t)action;
+    m.u.rail_cmd.xing_id = (uint8_t)xing_id;
+
+    if (rts_link_send(link, &m, &rep) != 0) {
+        return -1;
+    }
+    return (rep.result != 0) ? 1 : 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -130,7 +168,9 @@ static void *t_srv(void *arg)
     name_attach_t *att;
     rts_rcv_t      rcv;
     rts_reply_t    rep;
+    rts_link_t     ack_link;      /* this thread's own link to the railway */
     int            rcvid;
+    int            ack_xing;
     (void)arg;
 
     att = name_attach(NULL, SVC_CENTRAL, 0);
@@ -138,6 +178,7 @@ static void *t_srv(void *arg)
         printf("%scannot register %s%s\n", C(A_RED), SVC_CENTRAL, C(A_RESET));
         return NULL;
     }
+    rts_link_init(&ack_link, rts_node_rail(), SVC_RAILWAY, "railway");
     printf("central service : %s\n", SVC_CENTRAL);
 
     while (rts_running) {
@@ -161,6 +202,7 @@ static void *t_srv(void *arg)
         rep.hdr.sender = SND_CENTRAL;
         rep.hdr.t_ns   = rts_now_ns();
         rep.result     = 0;
+        ack_xing       = 0;
 
         pthread_mutex_lock(&g_lk);
         switch (rcv.msg.hdr.type) {
@@ -201,11 +243,11 @@ static void *t_srv(void *arg)
         }
 
         case MSG_GATE_FAULT:
-            flash(A_RED, "GATE FAULT at crossing X%d - train stopped",
+            flash(A_RED, "GATE FAULT at crossing X%d",
                   rcv.msg.u.gate_fault.xing_id);
-            rts_log("GATE FAULT reported at X%d, train stopped=%d",
-                    rcv.msg.u.gate_fault.xing_id,
-                    rcv.msg.u.gate_fault.train_stopped);
+            rts_log("GATE FAULT reported at X%d",
+                    rcv.msg.u.gate_fault.xing_id);
+            ack_xing = rcv.msg.u.gate_fault.xing_id;
             break;
 
         default:
@@ -215,8 +257,22 @@ static void *t_srv(void *arg)
         pthread_mutex_unlock(&g_lk);
 
         MsgReply(rcvid, EOK, &rep, sizeof(rep));
+
+        /* A gate fault is acknowledged to the railway straight away. It
+           goes after the reply, so the railway is never kept waiting on
+           the control room while it reports. */
+        if (ack_xing != 0) {
+            if (rail_send(&ack_link, RC_FAULT_ACK, ack_xing) == 0) {
+                rts_log("GATE FAULT at X%d acknowledged to the railway",
+                        ack_xing);
+            } else {
+                rts_log("could not acknowledge the GATE FAULT at X%d",
+                        ack_xing);
+            }
+        }
     }
 
+    rts_link_close(&ack_link);
     name_detach(att, 0);
     return NULL;
 }
@@ -246,6 +302,7 @@ static void *t_hb(void *arg)
             memset(&m, 0, sizeof(m));
             m.hdr.type   = MSG_HEARTBEAT;
             m.hdr.sender = SND_CENTRAL;
+            m.u.heartbeat.random_cars = (uint8_t)g_random;
 
             if (rts_link_send(&link[i], &m, NULL) != 0) {
                 /*
@@ -355,41 +412,24 @@ static void send_selected(rts_msg_t *m)
     }
 }
 
-static void cmd_pattern(int pattern, int use_custom)
+static void cmd_pattern(int pattern)
 {
     rts_msg_t m;
+    int       i;
 
     memset(&m, 0, sizeof(m));
     m.hdr.type              = MSG_SET_PATTERN;
     m.hdr.sender            = SND_CENTRAL;
     m.u.set_pattern.pattern = (uint8_t)pattern;
-    m.u.set_pattern.offset_s= (uint16_t)T_OFFSET_S;
 
-    if (use_custom) {
-        /* The advanced pattern: the control room supplies new green
-           times, which the local controller validates before use. */
-        m.u.set_pattern.green_s[PH_A] = 30;
-        m.u.set_pattern.green_s[PH_B] = 10;
-        m.u.set_pattern.green_s[PH_C] = 14;
-        m.u.set_pattern.green_s[PH_D] = 10;
+    if (pattern == PAT_UPDATED) {
+        /* The operator's own green times, not checked here. The local
+           controller refuses the whole update if one is unsafe, a green
+           under 8 s for example, and keeps running what it had. */
+        for (i = 0; i < PH_COUNT; i++) {
+            m.u.set_pattern.green_s[i] = (uint16_t)g_draft[i];
+        }
     }
-    send_selected(&m);
-}
-
-static void cmd_bad_pattern(void)
-{
-    rts_msg_t m;
-
-    /* Deliberately illegal: a green far below the pedestrian minimum.
-       The local controller must refuse it and say why. */
-    memset(&m, 0, sizeof(m));
-    m.hdr.type                    = MSG_SET_PATTERN;
-    m.hdr.sender                  = SND_CENTRAL;
-    m.u.set_pattern.pattern       = PAT_UPDATED;
-    m.u.set_pattern.green_s[PH_A] = 2;
-    m.u.set_pattern.green_s[PH_B] = 2;
-    m.u.set_pattern.green_s[PH_C] = 2;
-    m.u.set_pattern.green_s[PH_D] = 2;
     send_selected(&m);
 }
 
@@ -417,30 +457,38 @@ static void cmd_button(int ped_id)
     send_selected(&m);
 }
 
-static void cmd_gate(int xing_id, int action, const char *what)
+/* A car pulls up at the loop of one phase, as a detector would see it. */
+static void cmd_car(int phase)
 {
-    rts_msg_t   m;
-    rts_reply_t rep;
+    rts_msg_t m;
 
     memset(&m, 0, sizeof(m));
-    m.hdr.type              = MSG_GATE_CMD;
-    m.hdr.sender            = SND_CENTRAL;
-    m.u.gate_cmd.xing_id    = (uint8_t)xing_id;
-    m.u.gate_cmd.action     = (uint8_t)action;
+    m.hdr.type    = MSG_CAR_REQUEST;
+    m.hdr.sender  = SND_CENTRAL;
+    m.u.car.phase = (uint8_t)phase;
+    send_selected(&m);
+}
 
-    if (rts_link_send(&g_op_rail, &m, &rep) != 0) {
+/* Stop every train on the line, or let them run again. */
+static void cmd_line(int stop)
+{
+    int rc = rail_send(&g_op_rail, stop ? RC_STOP_TRAINS : RC_RESUME_TRAINS, 0);
+
+    if (rc < 0) {
         flash(A_RED, "the railway controller did not answer");
-    } else if (rep.result != 0) {
-        flash(A_AMBER, "the railway REFUSED %s at crossing X%d", what, xing_id);
+    } else if (rc > 0) {
+        flash(A_AMBER, "the railway REFUSED the command");
     } else {
-        flash(A_GREEN, "%s sent to crossing X%d", what, xing_id);
-        rts_log("operator sent %s to X%d", what, xing_id);
+        flash(stop ? A_RED : A_GREEN, "%s",
+              stop ? "every train stopped by the control room"
+                   : "trains released, the line runs again");
+        rts_log("operator %s every train", stop ? "stopped" : "released");
     }
 }
 
 static void *t_op(void *arg)
 {
-    int  ch;
+    int  ch, esc = 0;
     char svc[64], label[32];
     int  i;
     (void)arg;
@@ -458,6 +506,16 @@ static void *t_op(void *arg)
             rts_sleep_ms(200);
             continue;
         }
+        /* An arrow key arrives as ESC [ and a letter. Drop all three, or
+           its [ would change the phase on the UPDATED row. */
+        if (ch == 27) {
+            esc = 1;
+            continue;
+        }
+        if (esc) {
+            esc = (esc == 1 && ch == '[') ? 2 : 0;
+            continue;
+        }
 
         switch (ch) {
         case '1': case '2': case '3':
@@ -470,10 +528,20 @@ static void *t_op(void *arg)
             flash(A_CYAN, "selected all six intersections");
             break;
 
-        case 'f': cmd_pattern(PAT_FIXED,   0); break;
-        case 's': cmd_pattern(PAT_SENSOR,  0); break;
-        case 'u': cmd_pattern(PAT_UPDATED, 1); break;
-        case 'x': cmd_bad_pattern();           break;
+        case 'f': cmd_pattern(PAT_FIXED);   break;
+        case 's': cmd_pattern(PAT_SENSOR);  break;
+        case 'u': cmd_pattern(PAT_UPDATED); break;
+
+        /* The UPDATED row: [ and ] pick the phase, - and + change its
+           green by one second. Nothing is sent until u. */
+        case '[': g_draft_ph = (g_draft_ph + PH_COUNT - 1) % PH_COUNT; break;
+        case ']': g_draft_ph = (g_draft_ph + 1) % PH_COUNT;            break;
+        case '-':
+            if (g_draft[g_draft_ph] > 1) g_draft[g_draft_ph]--;
+            break;
+        case '+': case '=':
+            if (g_draft[g_draft_ph] < DRAFT_MAX_S) g_draft[g_draft_ph]++;
+            break;
 
         case 'o': cmd_override(1); break;
         case 'c': cmd_override(0); break;
@@ -481,12 +549,24 @@ static void *t_op(void *arg)
         case 'p': cmd_button(PD_N); break;
         case 'P': cmd_button(PD_E); break;
 
-        case 'a': cmd_gate(1, GC_REQUEST_TRAIN_A, "train on track A"); break;
-        case 'b': cmd_gate(1, GC_REQUEST_TRAIN_B, "train on track B"); break;
-        case 'g': cmd_gate(1, GC_INJECT_FAULT,    "gate fault");       break;
-        case 'G': cmd_gate(1, GC_CLEAR_FAULT,     "clear fault");      break;
-        case 'd': cmd_gate(1, GC_FORCE_DOWN,      "force gates down"); break;
-        case 'n': cmd_gate(1, GC_NORMAL,          "return to normal"); break;
+        /* Off peak requests: a car at the loop of phase A, B, C or D,
+           and random cars on or off at all six. */
+        case '!': cmd_car(PH_A); break;
+        case '@': cmd_car(PH_B); break;
+        case '#': cmd_car(PH_C); break;
+        case '$': cmd_car(PH_D); break;
+        case 'r':
+            g_random = !g_random;
+            flash(A_CYAN, "random cars %s at all six intersections",
+                  g_random ? "ON" : "OFF");
+            rts_log("operator turned random cars %s", g_random ? "on" : "off");
+            break;
+
+        /* The control room cannot put a train on the line or move a gate;
+           those keys are on the railway. When something is wrong on the
+           line it can stop every train, and let them run again. */
+        case 'e': cmd_line(1); break;
+        case 'E': cmd_line(0); break;
 
         case 'q': rts_running = 0; break;
         default:  break;
@@ -513,7 +593,7 @@ static void draw_inter(rts_frame_t *f, int id, const inter_rec_t *r,
                        int targeted)
 {
     const inter_status_t *st = &r->st;
-    char                  label[16], lamps[256], peds[128];
+    char                  label[16], lamps[256], peds[128], pattern[32];
 
     snprintf(label, sizeof(label), "I%d", id);
     rts_frame_add(f, " %s%s%s%s%-3s%s  ",
@@ -524,9 +604,21 @@ static void draw_inter(rts_frame_t *f, int id, const inter_rec_t *r,
                        C(A_GREY), "----");
         return;
     }
+    /* An override outranks the pattern, so it takes the column. UPDATED
+       shows the green times the intersection says it is running. */
+    if (st->override_active) {
+        snprintf(pattern, sizeof(pattern), "OVERRIDE");
+    } else if (st->pattern == PAT_UPDATED) {
+        snprintf(pattern, sizeof(pattern), "%u/%u/%u/%u",
+                 (unsigned)st->green_s[PH_A], (unsigned)st->green_s[PH_B],
+                 (unsigned)st->green_s[PH_C], (unsigned)st->green_s[PH_D]);
+    } else {
+        snprintf(pattern, sizeof(pattern), "%s",
+                 rts_pattern_name(st->pattern));
+    }
     rts_frame_line(f,
         "%s%-4s%s  %s%-2s%s %s%-7s%s   %s   %s   %sX%d%s %s%-7s%s  "
-        "%s%-8s%s  %s%s",
+        "%s%-11s%s  %s%s",
         r->online ? C(A_GREEN) : C(A_RED), r->online ? "up" : "DOWN",
         C(A_RESET),
         C(A_WHITE), rts_phase_name(st->phase), C(A_RESET),
@@ -536,41 +628,64 @@ static void draw_inter(rts_frame_t *f, int id, const inter_rec_t *r,
         C(A_GREY), xing_of(id), C(A_RESET),
         rts_xing_color(st->xing_state), rts_xing_name(st->xing_state),
         C(A_RESET),
-        /* an override outranks the pattern, so it takes the column */
-        st->override_active ? C(A_MAGENTA) : "",
-        st->override_active ? "OVERRIDE" : rts_pattern_name(st->pattern),
-        C(A_RESET),
+        st->override_active ? C(A_MAGENTA) : "", pattern, C(A_RESET),
         st->train_hold ? C(A_BG_RED) : "",
         st->train_hold ? " RAIL HOLD " : "");
 }
 
 /* One row of the crossing table, same widths as its heading. */
-static void draw_xing(rts_frame_t *f, int id, const xing_rec_t *r,
-                      int targeted)
+static void draw_xing(rts_frame_t *f, int id, const xing_rec_t *r)
 {
     const xing_status_t *st = &r->st;
-    char                 label[16], tracks[64];
+    char                 tracks[64];
 
-    snprintf(label, sizeof(label), "X%d", id);
-    rts_frame_add(f, " %s%s%s%s%-3s%s  ",
-                  C(A_CYAN), targeted ? ">" : " ", C(A_RESET),
-                  targeted ? C(A_CYAN) : C(A_WHITE), label, C(A_RESET));
+    rts_frame_add(f, "  %sX%-2d%s  ", C(A_WHITE), id, C(A_RESET));
     if (!r->online) {
         rts_frame_line(f, "%sno data yet", C(A_GREY));
         return;
     }
     rts_frame_line(f,
-        "%s%-7s%s  %s%-6s%s  %s     %s%-6s%s  %s%-6s%s  %-6u  %sI%d I%d",
+        "%s%-7s%s  %s%-6s%s  %s     %s%-6s%s  %-6u  %sI%d I%d",
         rts_xing_color(st->state), rts_xing_name(st->state), C(A_RESET),
         rts_gate_color(st->gate_pos), rts_gate_name(st->gate_pos),
         C(A_RESET),
         rts_tracks_str(tracks, sizeof(tracks), st->track_busy),
         st->train_signal ? C(A_GREEN) : C(A_RED),
         st->train_signal ? "GREEN" : "RED", C(A_RESET),
-        st->manual ? C(A_MAGENTA) : C(A_GREY),
-        st->manual ? "manual" : "auto", C(A_RESET),
         st->trains_served,
         C(A_GREY), 2 * id - 1, 2 * id);
+}
+
+/*
+ * The green times u will send. The phase that - and + change is marked,
+ * and a time the intersections will refuse is red: a green outside
+ * 8..60 s, or a cycle over 150 s. Sending it anyway is allowed, which is
+ * how the refusal is shown.
+ */
+static void draw_draft(rts_frame_t *f)
+{
+    double cycle = 0.0;
+    int    i, bad, sel;
+
+    rts_frame_add(f, "  %s%-9s%s", C(A_GREY), "UPDATED", C(A_RESET));
+    for (i = 0; i < PH_COUNT; i++) {
+        bad    = g_draft[i] < G_MIN_S || g_draft[i] > G_MAX_S;
+        sel    = (i == g_draft_ph);
+        cycle += g_draft[i] + T_AMBER_S + T_ALLRED_S;
+        rts_frame_add(f, "%s%s%s %s%c%2d%c%s   ",
+                      C(A_WHITE), rts_phase_name((uint8_t)i), C(A_RESET),
+                      sel ? C(bad ? A_BG_RED : A_KEY)
+                          : C(bad ? A_RED : A_WHITE),
+                      sel ? '>' : ' ', g_draft[i], sel ? '<' : ' ',
+                      C(A_RESET));
+    }
+    rts_frame_add(f, "%scycle %.0f s%s   ",
+                  cycle > T_CYCLE_MAX_S ? C(A_RED) : C(A_GREEN), cycle,
+                  C(A_RESET));
+    rts_frame_key(f, "[ ]", "phase");
+    rts_frame_add(f, "  ");
+    rts_frame_key(f, "- +", "1 s");
+    rts_frame_eol(f);
 }
 
 static void *t_display(void *arg)
@@ -582,7 +697,7 @@ static void *t_display(void *arg)
     const char        *msg_color;
     uint64_t           msg_ns;
     char               right[80], target[8];
-    int                rail_up, sel, i;
+    int                rail_up, stopped, sel, i;
     (void)arg;
 
     while (rts_running) {
@@ -596,6 +711,15 @@ static void *t_display(void *arg)
         memcpy(xr, g_x, sizeof(xr));
         rail_up = g_rail_online;
         pthread_mutex_unlock(&g_lk);
+
+        /* Every crossing reports whether the control room has stopped the
+           trains, so any crossing that is online will do. */
+        stopped = 0;
+        for (i = 0; i < RTS_N_CROSSINGS; i++) {
+            if (xr[i].online && xr[i].st.line_stopped) {
+                stopped = 1;
+            }
+        }
 
         pthread_mutex_lock(&g_flash_lk);
         memcpy(msg, g_flash, sizeof(msg));
@@ -617,7 +741,7 @@ static void *t_display(void *arg)
         rts_frame_line(&f, "");
 
         rts_frame_line(&f, "  %s%-3s  %-4s  %-2s %-7s   %-26s   %-7s   "
-                       "%-10s  %-8s  %-11s",
+                       "%-10s  %-11s  %-11s",
                        C(A_HEAD), "INT", "LINK", "PH", "STATE",
                        "  A      B      C      D", "PED", "CROSSING",
                        "PATTERN", "");
@@ -629,12 +753,11 @@ static void *t_display(void *arg)
                        "(R3 crosses the tracks)", C(A_GREY));
         rts_frame_line(&f, "");
 
-        rts_frame_line(&f, "  %s%-3s  %-7s  %-6s  %-6s  %-6s  %-6s  %-6s  "
-                       "%-6s", C(A_HEAD), "X", "STATE", "GATES", "TRACKS",
-                       "SIGNAL", "MODE", "TRAINS", "SERVES");
+        rts_frame_line(&f, "  %s%-3s  %-7s  %-6s  %-6s  %-6s  %-6s  %-6s",
+                       C(A_HEAD), "X", "STATE", "GATES", "TRACKS", "SIGNAL",
+                       "TRAINS", "SERVES");
         for (i = 0; i < RTS_N_CROSSINGS; i++) {
-            /* the gate keys below always act on X1 */
-            draw_xing(&f, i + 1, &xr[i], i == 0);
+            draw_xing(&f, i + 1, &xr[i]);
         }
         rts_frame_line(&f, "");
 
@@ -644,8 +767,9 @@ static void *t_display(void *arg)
         } else {
             rts_frame_line(&f, "");
         }
-        rts_frame_line(&f, "");
 
+        /* The key rows follow straight on: the window is 24 rows and the
+           panel has to stay inside 23 of them. */
         rts_frame_add(&f, "  %s%-9s%s%s%-5s%s", C(A_GREY), "TARGET",
                       C(A_RESET), C(A_CYAN), target, C(A_RESET));
         rts_frame_key(&f, "1-6", "pick one");
@@ -655,13 +779,21 @@ static void *t_display(void *arg)
         rts_frame_key(&f, "q", "quit");
         rts_frame_eol(&f);
         rts_frame_keys(&f, 9, "PATTERN", "f", "fixed", "s", "sensor",
-                       "u", "updated", "x", "illegal, must be refused", NULL);
+                       "u", "updated, times below", NULL);
+        draw_draft(&f);
         rts_frame_keys(&f, 9, "COMMAND", "o", "override, hold A",
-                       "c", "cancel", "p", "ped button N",
-                       "P", "ped button E", NULL);
-        rts_frame_keys(&f, 9, "X1 GATE", "a", "train track A",
-                       "b", "train track B", "g", "fault", "G", "clear",
-                       "d", "gates down", "n", "normal", NULL);
+                       "c", "cancel", NULL);
+        rts_frame_keys(&f, 9, "SENSOR", "p", "ped N", "P", "ped E",
+                       "!", "car A", "@", "car B", "#", "car C",
+                       "$", "car D", "r",
+                       g_random ? "random cars ON" : "random cars OFF", NULL);
+        rts_frame_add(&f, "  %s%-9s%s", C(A_GREY), "RAILWAY", C(A_RESET));
+        rts_frame_key(&f, "e", "stop all trains");
+        rts_frame_add(&f, "  ");
+        rts_frame_key(&f, "E", "let them run");
+        rts_frame_add(&f, "    %s%s", stopped ? C(A_RED) : C(A_GREEN),
+                      stopped ? "trains STOPPED" : "trains running");
+        rts_frame_eol(&f);
         rts_frame_end(&f);
     }
     printf("%s%s", C(A_SHOW), C(A_WRAP));

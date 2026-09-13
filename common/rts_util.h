@@ -72,9 +72,6 @@ int  rts_timer_new(timer_t *t, const rts_chan_t *c, int prio, int code, int valu
 int  rts_timer_once(timer_t t, uint64_t ms);
 /* Arm a repeating timer. */
 int  rts_timer_every(timer_t t, uint64_t ms);
-/* Arm a one shot for an absolute CLOCK_MONOTONIC time (rts_now_ns()
-   scale). A time already past fires straight away. */
-int  rts_timer_at(timer_t t, uint64_t abs_ns);
 
 /* ---------------- sending ------------------------------------------ */
 

@@ -14,7 +14,6 @@
 #   rtst.sh frame c|r        print the tail of that screen capture
 #   rtst.sh vm2 N            print the tail of intersection N's screen
 #   rtst.sh logs             print all eight test logs, current run only
-#   rtst.sh shm              dump the VM2 corridor region (green wave)
 #   rtst.sh ps               where each process is running
 #   rtst.sh kill NAME [node] slay one process (node vm1|vm2|vm3)
 #   rtst.sh restart NAME     start one process again (central, railway, iN)
@@ -59,7 +58,7 @@ start)
     echo $SP > $SP_FILE
     holders
     start_rail;                       sleep 2
-    [ "$3" = noauto ] && printf t > $T/r.in
+    [ "$3" = noauto ] && printf n > $T/r.in     # timetable NONE
     for n in 1 2 3 4 5 6; do start_inter $n; sleep 1; done
     sleep 1
     start_central;                    sleep 2
@@ -78,11 +77,6 @@ trunc)
 snap)
     tail -c 5000 ${O}c.out; echo "#### VM2"
     for n in 1 2 3 4 5 6; do tail -n 4 ${O}i$n.out; done ;;
-shm)
-    # the corridor region the six controllers share on vm2, as bytes:
-    # each slot carries the planned start of that controller's cycle on
-    # vm2's own clock, which is the only common time base they have
-    od -A n -t u1 /net/vm2/dev/shmem/rts_corridor ;;
 logs)
     for f in $T/central.log /net/vm2/data/var/tmp/manh/t/intersection_I1.log \
              /net/vm2/data/var/tmp/manh/t/intersection_I2.log /net/vm2/data/var/tmp/manh/t/intersection_I3.log \
@@ -107,5 +101,5 @@ restart)
     esac
     sleep 1; echo "restarted $2" ;;
 *)
-    sed -n '2,20p' $0 ;;
+    sed -n '2,19p' $0 ;;
 esac

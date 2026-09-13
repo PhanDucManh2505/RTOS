@@ -46,11 +46,11 @@ enum {
 #define MSG_SET_PATTERN   (MSG_BASE + 2)   /* central -> intersection           */
 #define MSG_OVERRIDE      (MSG_BASE + 3)   /* central -> intersection           */
 #define MSG_PED_BUTTON    (MSG_BASE + 4)   /* central -> intersection           */
-#define MSG_QUERY_STATE   (MSG_BASE + 5)   /* central -> intersection           */
 #define MSG_STATUS        (MSG_BASE + 6)   /* intersection -> central           */
 #define MSG_XING_STATE    (MSG_BASE + 7)   /* railway -> intersection / central */
-#define MSG_GATE_CMD      (MSG_BASE + 8)   /* central -> railway                */
+#define MSG_RAIL_CMD      (MSG_BASE + 8)   /* central -> railway                */
 #define MSG_GATE_FAULT    (MSG_BASE + 9)   /* railway -> central                */
+#define MSG_CAR_REQUEST   (MSG_BASE + 10)  /* central -> intersection           */
 
 /* ------------------------------------------------------------------ */
 /* Pulse codes (a pulse carries one byte of code and four of value)    */
@@ -133,15 +133,13 @@ typedef enum {
 /* Boom gate position. */
 typedef enum { GATE_UP = 0, GATE_MOVING = 1, GATE_DOWN = 2 } gate_pos_t;
 
-/* Actions the control room can ask the railway controller to take. */
+/* What the control room can tell the railway controller. It never drives a
+   train or a gate: it can stop every train when something is wrong on the
+   line, let them run again, and acknowledge a gate fault. */
 enum {
-    GC_NORMAL = 0,      /* release manual control            */
-    GC_FORCE_DOWN,      /* hold the gates down               */
-    GC_FORCE_UP,        /* hold the gates up (maintenance)   */
-    GC_INJECT_FAULT,    /* simulate a gate that will not move */
-    GC_CLEAR_FAULT,
-    GC_REQUEST_TRAIN_A, /* send a test train on track A      */
-    GC_REQUEST_TRAIN_B  /* send a test train on track B      */
+    RC_STOP_TRAINS = 1, /* every train signal red, no train moves on      */
+    RC_RESUME_TRAINS,   /* let them run again                              */
+    RC_FAULT_ACK        /* the gate fault at xing_id has been seen         */
 };
 
 /* Why a command was refused. */
@@ -183,7 +181,6 @@ typedef struct {
     uint8_t  override_active;
     uint8_t  pad0;
     uint16_t green_s[PH_COUNT];    /* green time in force per phase    */
-    uint32_t cycle_count;
 } inter_status_t;
 
 /* Full picture of one level crossing. */
@@ -194,7 +191,7 @@ typedef struct {
     uint8_t  gate_pos;     /* gate_pos_t                             */
     uint8_t  gate_fault;   /* 1 = a gate is stuck                    */
     uint8_t  train_signal; /* 0 = red to the train, 1 = green        */
-    uint8_t  manual;       /* 1 = the control room is holding it     */
+    uint8_t  line_stopped; /* 1 = the control room stopped the trains */
     uint8_t  pad0;
     uint32_t seq;          /* +1 on every published change           */
     uint32_t trains_served;
@@ -209,7 +206,6 @@ typedef struct {
             uint8_t  pattern;              /* pattern_t                */
             uint8_t  pad0;
             uint16_t green_s[PH_COUNT];    /* 0 = keep the current value */
-            uint16_t offset_s;
         } set_pattern;
 
         struct {
@@ -220,9 +216,13 @@ typedef struct {
 
         struct { uint8_t ped_id; } button; /* PD_N .. PD_W */
 
-        struct { uint8_t xing_id; uint8_t action; } gate_cmd;
+        struct { uint8_t phase; } car;             /* MSG_CAR_REQUEST       */
 
-        struct { uint8_t xing_id; uint8_t gate; uint8_t train_stopped; } gate_fault;
+        struct { uint8_t random_cars; } heartbeat; /* 1 = random cars on    */
+
+        struct { uint8_t xing_id; uint8_t action; } rail_cmd;
+
+        struct { uint8_t xing_id; uint8_t gate; } gate_fault;
 
         inter_status_t status;
         xing_status_t  xing;
@@ -235,7 +235,6 @@ typedef struct {
     int32_t        result;   /* 0 = accepted, negative = refused */
     uint8_t        reason;   /* one of the REJ_* codes           */
     uint8_t        pad[3];
-    inter_status_t status;   /* only filled in for MSG_QUERY_STATE */
 } rts_reply_t;
 
 /*

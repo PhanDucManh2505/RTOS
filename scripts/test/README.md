@@ -11,14 +11,11 @@ read their keys from a FIFO so a test can "press" keys, and every screen is
 captured as plain text (`RTS_COLOR=0`). Test runs log to `/tmp/manh/t` on
 each node, so the demo logs in `/tmp/manh` are left alone.
 
-Three things are read back:
+Two things are read back:
 
 * the **screens** of central and railway, parsed column by column;
 * the **logs**, one line per lamp change, including `mv=` - all eight
-  vehicle lamps at that instant, which is what the railway checks use;
-* the **corridor region** on vm2 (`/dev/shmem/rts_corridor`), which is the
-  only clock all six controllers share and therefore the one place the
-  12 s green-wave offset can be measured exactly.
+  vehicle lamps at that instant, which is what the railway checks use.
 
 ## Run
 
@@ -33,9 +30,10 @@ $env:RTS_SPEED=1; python rts_tests.py g2   # the same at real time
 ```
 
 Groups: `g1` start-up, nodes, safe sequence, monitoring · `g2` railway
-pre-emption, the movements a train forbids, two trains · `g3` pedestrians ·
-`g4` targeting, refused and updated patterns · `g5` FIXED timing and the
-green wave · `g6` override · `g7` gate faults and gate commands · `g8`
+pre-emption, the movements a train forbids, trains along the line and two
+meeting at X2 · `g3` off-peak requests and pedestrians ·
+`g4` targeting, refused and updated patterns · `g5` FIXED timing ·
+`g6` override · `g7` gate faults and their acknowledgement, stopping the trains, the timetable · `g8`
 central, railway and intersection failures.
 
 `RTS_FIXED_CYCLES=8` sets how many cycles g5 watches, `RTS_OUT=<dir>` where
@@ -50,7 +48,9 @@ crossing is not clear · `T04m` the clearing green shows only the movement
 that comes out of that arm · `T04n` every other movement of the phase still
 runs · `T04r` a movement caught mid-green still gets its whole 4 s amber ·
 `T04o`/`T04p` under a long hold the cycle still steps A→B→C→D and still
-measures 90 s · `T11b` the pair is exactly 12 s apart.
+measures 90 s · `T20a`/`T20b` a train is detected X1 → X2 → X3, or back, 60 s
+and 90 s apart · `T05` two trains meeting at X2 keep its gates down until both
+have gone.
 
 The tests open one SSH connection per command, and `sshd` on the target
 occasionally sits on a new connection for minutes; `ssh()` therefore retries
