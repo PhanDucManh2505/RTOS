@@ -12,10 +12,10 @@ param(
 )
 
 # Speed rides in as RTS_SPEED so it reaches the six intersections too
-# (run_vm2.sh starts them in the background without passing -s along).
+# (run_vm2_panel.sh starts them in the background without passing -s along).
 $tabs = @(
     @{ Title = "VM3 railway";       Cmd = "on -f vm3 -e RTS_SPEED=$Speed $Dir/run_vm3.sh"; Wait = 3 },
-    @{ Title = "VM2 intersections"; Cmd = "on -f vm2 -e RTS_SPEED=$Speed $Dir/run_vm2.sh"; Wait = 9 },
+    @{ Title = "VM2 intersections"; Cmd = "on -f vm2 -e RTS_SPEED=$Speed $Dir/run_vm2_panel.sh"; Wait = 9 },
     @{ Title = "VM1 central";       Cmd = "RTS_SPEED=$Speed $Dir/run_vm1.sh";              Wait = 0 }
 )
 

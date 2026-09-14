@@ -21,8 +21,9 @@
  *                       A phase that overruns is only a queue.
  *
  *   prio 12  t_srv      owns the command channel "rts_iN". Receives
- *                       commands from the control room, validates them
- *                       and answers accept or reject.
+ *                       commands from the control room and the button
+ *                       and car presses of the VM2 panel, validates
+ *                       them and answers accept or reject.
  *
  *   prio 10  t_report   sends a status message to the control room on
  *                       every lamp change. A status message that
@@ -51,6 +52,10 @@ typedef struct {
                                 of a pair, so it is on opposite sides of
                                 them. Movements that end in this arm are
                                 the ones a train forbids.               */
+    const char *road_ns;     /* "R1" or "R2": the north-south road, which
+                                runs beside the tracks. Phases A and B.  */
+    const char *road_ew;     /* "R3", "R4" or "R5": the east-west road,
+                                which crosses the tracks. Phases C and D. */
     const char *label;       /* "I1"                                     */
 } inter_cfg_t;
 

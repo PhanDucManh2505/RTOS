@@ -6,6 +6,7 @@
  * only the identity and the level crossing it sits next to are
  * different.
  *
+ *   roads R2 (north-south) and R3 (east-west, over the tracks)
  *   crossing X1 is between I2 and I1
  *   tracks cross its west arm
  *
@@ -19,6 +20,8 @@ int main(int argc, char **argv)
         .id        = 2,
         .sender_id = SND_I2,
         .xing_id   = 1,
+        .road_ns   = "R2",
+        .road_ew   = "R3",
         .rail_arm  = ARM_W,       /* X1 is on the west side of I2 */
         .label     = "I2"
     };

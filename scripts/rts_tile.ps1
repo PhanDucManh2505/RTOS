@@ -4,7 +4,7 @@
 #   +----------------------------+--------------+
 #   | VM1 central                | VM3 railway  |
 #   +----------------------------+--------------+
-#   | VM2 six intersections                     |
+#   | VM2 six intersections and their panel     |
 #   +-------------------------------------------+
 #
 # Every window SSHes into VM1, the only node that accepts key login; the VM2
@@ -17,8 +17,9 @@
 # and the railway title bar is 65. That is also why they are not shown on the
 # VirtualBox consoles, which are 80 columns wide.
 #
-# VM2 runs run_vm2_lines.sh rather than run_vm2.sh so the six controllers'
-# output reaches the shared window a whole line at a time (see that script).
+# VM2 runs run_vm2_panel.sh: inter_panel owns that window. It shows the six
+# controllers' output as a table that scrolls with the mouse wheel (lines up
+# to 140 columns) and has the pedestrian and car keys (see that script).
 #
 # Running it again restarts everything cleanly: the old windows are closed and
 # every RTS process on all three nodes is stopped first.
@@ -77,7 +78,7 @@ foreach ($t in $titles) {
         [RtsWin]::PostMessage($h, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null   # WM_CLOSE
     }
 }
-ssh -o BatchMode=yes root@$VM1 'for p in central railway intersection_i1 intersection_i2 intersection_i3 intersection_i4 intersection_i5 intersection_i6; do slay -f $p; on -f vm2 slay -f $p; on -f vm3 slay -f $p; done 2>/dev/null'
+ssh -o BatchMode=yes root@$VM1 'for p in central railway inter_panel intersection_i1 intersection_i2 intersection_i3 intersection_i4 intersection_i5 intersection_i6; do slay -f $p; on -f vm2 slay -f $p; on -f vm3 slay -f $p; done 2>/dev/null'
 foreach ($t in $titles) {
     for ($i = 0; $i -lt 25 -and [RtsWin]::FindWindow($WT_CLASS, $t) -ne [IntPtr]::Zero; $i++) {
         Start-Sleep -Milliseconds 200
@@ -91,7 +92,7 @@ Start-Sleep -Seconds 2          # let name_attach release the service names
 # bottom one.
 Open-Node "rts-vm3" "VM3 railway"       "on -f vm3 -e RTS_SPEED=$Speed $Dir/run_vm3.sh"       "67,24"
 Start-Sleep -Seconds 3
-Open-Node "rts-vm2" "VM2 intersections" "on -f vm2 -e RTS_SPEED=$Speed $Dir/run_vm2_lines.sh" "178,23"
+Open-Node "rts-vm2" "VM2 intersections" "on -f vm2 -e RTS_SPEED=$Speed $Dir/run_vm2_panel.sh" "178,23"
 Start-Sleep -Seconds 9          # the six starts are staggered one second apart
 Open-Node "rts-vm1" "VM1 central"       "RTS_SPEED=$Speed $Dir/run_vm1.sh"                    "105,24"
 

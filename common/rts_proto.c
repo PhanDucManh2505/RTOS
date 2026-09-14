@@ -10,15 +10,6 @@ const char *rts_mv_name(int mv)
     return mv_names[mv];
 }
 
-const char *rts_lamp_name(uint8_t lamp)
-{
-    switch (lamp) {
-        case LAMP_GREEN: return "GREEN";
-        case LAMP_AMBER: return "AMBER";
-        default:         return "RED";
-    }
-}
-
 const char *rts_phase_name(uint8_t phase)
 {
     switch (phase) {
@@ -93,7 +84,6 @@ const char *rts_reject_name(uint8_t reason)
         case REJ_CYCLE_TOO_LONG:  return "cycle too long";
         case REJ_CONFLICT:        return "would release a conflicting movement";
         case REJ_BAD_PHASE:       return "no such phase";
-        case REJ_PREEMPT_ACTIVE:  return "railway pre-emption is active";
         case REJ_RAIL_ENTRY:      return "would drive into the railway area";
         default:                  return "?";
     }

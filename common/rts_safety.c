@@ -2,12 +2,14 @@
 #include <string.h>
 
 /*
- * Phase A : R1 through          (MV_NS, MV_SN) + pedestrians E and W
- * Phase B : R1 right turns      (MV_NW, MV_SE)
- * Phase C : R3 through          (MV_EW, MV_WE) + pedestrians N and S
- * Phase D : R3 right turns      (MV_WS, MV_EN)
+ * Phase A : N-S road through      (MV_NS, MV_SN) + pedestrians E and W
+ * Phase B : N-S road right turns  (MV_NW, MV_SE)
+ * Phase C : E-W road through      (MV_EW, MV_WE) + pedestrians N and S
+ * Phase D : E-W road right turns  (MV_WS, MV_EN)
  *
- * R3 is the road that runs over the railway. The tracks cross it on one
+ * The N-S road is R1 or R2 and the E-W road R3, R4 or R5, depending on
+ * the intersection (inter_cfg_t). The E-W road is the one that runs over
+ * the railway. The tracks cross it on one
  * side of the intersection only, so "the road over the tracks" is not a
  * whole phase: it is the two movements that end in that one arm. Those
  * are the movements a train forbids, and they sit in two different
@@ -34,10 +36,11 @@ static const int mv_to_tab[MV_COUNT] = {
     ARM_S, ARM_N    /* WS, EN */
 };
 
-/* PED_E and PED_W cross R3, so they run alongside the R1 traffic in
-   phase A. PED_N and PED_S cross R1, so they run in phase C. No
-   pedestrian ever runs during a right turn phase, because a turning
-   vehicle would cut straight across the crossing. */
+/* PED_E and PED_W cross the east-west road, so they run alongside the
+   north-south traffic in phase A. PED_N and PED_S cross the north-south
+   road, so they run in phase C. No pedestrian ever runs during a right
+   turn phase, because a turning vehicle would cut straight across the
+   crossing. */
 static const int ped_phase_tab[PD_COUNT] = {
     PH_C,   /* PD_N */
     PH_C,   /* PD_S */
@@ -45,28 +48,10 @@ static const int ped_phase_tab[PD_COUNT] = {
     PH_A    /* PD_W */
 };
 
-int rts_mv_phase(int mv)
-{
-    if (mv < 0 || mv >= MV_COUNT) return -1;
-    return mv_phase_tab[mv];
-}
-
 int rts_ped_phase(int pd)
 {
     if (pd < 0 || pd >= PD_COUNT) return -1;
     return ped_phase_tab[pd];
-}
-
-int rts_mv_from(int mv)
-{
-    if (mv < 0 || mv >= MV_COUNT) return ARM_NONE;
-    return mv_from_tab[mv];
-}
-
-int rts_mv_to(int mv)
-{
-    if (mv < 0 || mv >= MV_COUNT) return ARM_NONE;
-    return mv_to_tab[mv];
 }
 
 uint8_t rts_phase_mask(int phase)
@@ -186,9 +171,4 @@ void rts_lamps_phase_masked(uint8_t veh[MV_COUNT], int phase,
                  !(blocked & (uint8_t)(1u << i));
         veh[i] = on ? colour : (uint8_t)LAMP_RED;
     }
-}
-
-void rts_lamps_phase(uint8_t veh[MV_COUNT], int phase, uint8_t colour)
-{
-    rts_lamps_phase_masked(veh, phase, colour, 0);
 }

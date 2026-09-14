@@ -3,7 +3,7 @@
  *
  * Nothing here knows anything about traffic lights. It is only the
  * small wrappers around channels, timers, threads and MsgSend() that
- * would otherwise be copied into all eight programs.
+ * would otherwise be copied into all nine programs.
  */
 #ifndef RTS_UTIL_H
 #define RTS_UTIL_H
@@ -88,7 +88,6 @@ typedef struct {
     int      online;
     int      misses;
     uint32_t seq;
-    uint64_t last_ok_ns;
 } rts_link_t;
 
 void rts_link_init(rts_link_t *l, const char *node, const char *svc,

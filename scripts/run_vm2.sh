@@ -7,7 +7,7 @@
 #
 #   ./run_vm2.sh            start all six
 #   ./run_vm2.sh 1          start only I1, in the foreground
-#   ./run_vm2.sh stop       stop all six
+#   ./run_vm2.sh stop       stop all six, and the panel if it runs
 cd "$(dirname "$0")" || exit 1
 export RTS_NODE_CENTRAL=${RTS_NODE_CENTRAL:-vm1}
 export RTS_NODE_INTER=${RTS_NODE_INTER:-vm2}
@@ -17,6 +17,7 @@ mkdir -p /fs/rts
 
 if [ "$1" = "stop" ]; then
     for n in 1 2 3 4 5 6; do slay -f "intersection_i$n" 2>/dev/null; done
+    slay -f inter_panel 2>/dev/null
     echo "all six local controllers stopped"
     exit 0
 fi

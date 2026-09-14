@@ -23,12 +23,10 @@
 
 #define A_RESET    "\033[0m"
 #define A_BOLD     "\033[1m"
-#define A_DIM      "\033[2m"
 #define A_RED      "\033[1;38;5;196m"    /* alarms: DOWN, FAULT, CLOSED  */
 #define A_AMBER    "\033[1;38;5;214m"    /* amber lamps, WARNING         */
 #define A_GREEN    "\033[1;38;5;40m"     /* green lamps, up, CLEAR       */
 #define A_LAMP_RED "\033[38;5;160m"      /* a red lamp: normal, not news */
-#define A_BLUE     "\033[1;38;5;33m"
 #define A_MAGENTA  "\033[1;38;5;170m"    /* override                     */
 #define A_CYAN     "\033[1;38;5;45m"     /* names: I1, X1                */
 #define A_WHITE    "\033[1;97m"
@@ -69,15 +67,12 @@ const char *rts_gate_color(uint8_t pos);
 /* The eight vehicle lamps, grouped by the phase that releases them,
    each movement name printed in its lamp colour:
        NS SN  NW SE  EW WE  WS EN        (phase A, B, C, D)            */
-#define RTS_LAMPS_W 26
 char *rts_lamps_str(char *buf, size_t n, const uint8_t veh[MV_COUNT]);
 
 /* The four pedestrian lamps, "N S E W", each arm in its lamp colour. */
-#define RTS_PEDS_W 7
 char *rts_peds_str(char *buf, size_t n, const uint8_t ped[PD_COUNT]);
 
 /* The two tracks of a crossing, "A B", red where a train is on it. */
-#define RTS_TRACKS_W 3
 char *rts_tracks_str(char *buf, size_t n, uint8_t busy);
 
 /* Append printf-style text to a string being built in buf[n]. Returns

@@ -109,4 +109,3 @@ void rts_log_stop(void)
 }
 
 unsigned rts_log_drops(void) { return g_drops; }
-const char *rts_log_path(void) { return g_path; }

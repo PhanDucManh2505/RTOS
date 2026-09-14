@@ -88,6 +88,12 @@ void rts_install_signals(void)
     sa.sa_handler = on_signal;
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+
+    /* The six controllers on VM2 write their screen into a FIFO that the
+       panel reads. If the panel goes away the write must fail, not kill
+       the controller: losing the picture must never cost the lights. */
+    sa.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &sa, NULL);
 }
 
 int rts_start(const char *proc_name, int argc, char **argv)
@@ -316,7 +322,6 @@ int rts_link_send(rts_link_t *l, rts_msg_t *m, rts_reply_t *r)
         rts_log("LINK %s up", l->label);
     }
     l->misses     = 0;
-    l->last_ok_ns = rts_now_ns();
     return 0;
 }
 

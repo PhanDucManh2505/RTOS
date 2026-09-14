@@ -147,7 +147,7 @@ static int             g_term_raw    = 0;
 static pthread_mutex_t g_train_lk;
 static train_t         g_train[N_TRAINS];
 static uint32_t        g_train_no;
-static int             g_timetable = TT_RUSH;
+static int             g_timetable = TT_NONE;  /* no trains until picked */
 static int             g_next_dir  = DIR_NS;   /* the timetable alternates */
 static uint64_t        g_next_ns;              /* when it sends the next   */
 
@@ -978,9 +978,8 @@ int main(int argc, char **argv)
                x->id, x->inter_a, x->inter_b);
     }
 
-    /* The first timetabled train comes after half an interval, so a
-       demonstration does not open with two silent minutes. */
-    g_next_ns = rts_now_ns() + rts_ns(tt_interval_s(g_timetable) / 2.0);
+    /* No timetable at start: the line stays quiet until the operator
+       picks one, and timetable_set() starts its clock then. */
 
     term_raw();
 

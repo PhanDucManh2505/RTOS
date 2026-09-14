@@ -20,7 +20,5 @@ void rts_log(const char *fmt, ...);
 void rts_log_stop(void);
 /* How many lines had to be dropped because the buffer was full. */
 unsigned rts_log_drops(void);
-/* Full path of the file being written, for the demonstration. */
-const char *rts_log_path(void);
 
 #endif /* RTS_LOG_H */

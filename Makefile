@@ -29,7 +29,7 @@ CORE_OBJ   := $(OBJ)/intersection_core.o
 INTERSECTIONS := i1 i2 i3 i4 i5 i6
 INTER_BINS    := $(addprefix $(BIN)/intersection_,$(INTERSECTIONS))
 
-ALL_BINS := $(BIN)/central $(BIN)/railway $(INTER_BINS)
+ALL_BINS := $(BIN)/central $(BIN)/railway $(BIN)/inter_panel $(INTER_BINS)
 
 .PHONY: all clean deploy dirs
 
@@ -51,6 +51,9 @@ $(BIN)/central: $(OBJ)/central.o $(COMMON_OBJ)
 	$(QCC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(BIN)/railway: $(OBJ)/railway.o $(COMMON_OBJ)
+	$(QCC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+$(BIN)/inter_panel: $(OBJ)/inter_panel.o $(COMMON_OBJ)
 	$(QCC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(BIN)/intersection_%: $(OBJ)/intersection_%.o $(CORE_OBJ) $(COMMON_OBJ)

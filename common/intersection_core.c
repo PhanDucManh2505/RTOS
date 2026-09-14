@@ -59,15 +59,19 @@ typedef struct {
     int      pattern;
     uint16_t green_s[PH_COUNT];
 
-    /* override from the control room */
+    /* override from the control room: the phase to hold and how much
+       green it is still owed. The time is green time, not wall-clock
+       time - it runs only while the phase is showing green - so a
+       train that interrupts the hold pauses the clock rather than
+       eating it. */
     int      ov_active;
     int      ov_phase;
-    uint64_t ov_until_ns;
+    uint64_t ov_left_ns;      /* green still owed, banked while not green */
+    uint64_t ov_since_ns;     /* when the current green began, 0 if none  */
 
     /* railway */
     int      xing_state;      /* last state read from the railway node */
     uint64_t xing_last_ns;    /* when we last heard from it            */
-    int      xing_seen;       /* 1 once the railway has ever answered  */
     int      hold_rail;       /* 1 = phases C and D are shut down      */
     int      pre_pending;     /* 1 = pre-emption asked for, not done   */
     int      pre_done;        /* 1 = the clearing green has been given */
@@ -99,10 +103,10 @@ static ictl_t G;
 static uint16_t default_green(int phase)
 {
     switch (phase) {
-        case PH_A: return (uint16_t)G_R1_S;
-        case PH_B: return (uint16_t)G_RT1_S;
-        case PH_C: return (uint16_t)G_R3_S;
-        default:   return (uint16_t)G_RT3_S;
+        case PH_A: return (uint16_t)G_NS_S;
+        case PH_B: return (uint16_t)G_NS_RT_S;
+        case PH_C: return (uint16_t)G_EW_S;
+        default:   return (uint16_t)G_EW_RT_S;
     }
 }
 
@@ -131,6 +135,70 @@ static uint8_t rail_block(const ictl_t *s)
         return 0;
     }
     return rts_rail_block_mask(s->cfg->rail_arm);
+}
+
+/* ------------------------------------------------------------------ */
+/* override                                                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * An override whose phase drives into the rail-side arm gives way to a
+ * train: while the crossing is not clear it waits, the normal hold runs
+ * and the phase is held only once the train has gone. A phase that never
+ * touches that arm is not held up.
+ */
+static int override_waiting(const ictl_t *s)
+{
+    return s->ov_active &&
+           (rts_phase_mask(s->ov_phase) & rail_block(s)) != 0;
+}
+
+/* Green the override is still owed, counting the green in progress. */
+static uint64_t override_left(const ictl_t *s)
+{
+    uint64_t used;
+
+    if (s->ov_since_ns == 0) {
+        return s->ov_left_ns;
+    }
+    used = rts_now_ns() - s->ov_since_ns;
+    return (used < s->ov_left_ns) ? s->ov_left_ns - used : 0;
+}
+
+/* An override that still has green to give and is not waiting. */
+static int override_wants(const ictl_t *s)
+{
+    return s->ov_active && override_left(s) > 0 && !override_waiting(s);
+}
+
+/* Is an override in force for the phase that is green right now? */
+static int override_holds(const ictl_t *s)
+{
+    return override_wants(s) && s->ov_phase == s->phase && !s->pre_pending;
+}
+
+/* Does an override want a phase other than the one that is green? */
+static int override_elsewhere(const ictl_t *s)
+{
+    return override_wants(s) && s->ov_phase != s->phase;
+}
+
+/* The override's phase has just gone green: its clock runs. */
+static void override_green_begins(ictl_t *s)
+{
+    if (s->ov_active && s->phase == s->ov_phase && s->ov_since_ns == 0 &&
+        !override_waiting(s)) {
+        s->ov_since_ns = rts_now_ns();
+    }
+}
+
+/* That green has ended, for whatever reason: bank what is left. */
+static void override_green_ends(ictl_t *s)
+{
+    if (s->ov_since_ns != 0) {
+        s->ov_left_ns  = override_left(s);
+        s->ov_since_ns = 0;
+    }
 }
 
 /*
@@ -301,7 +369,9 @@ static void fill_status(const ictl_t *s, inter_status_t *st)
     st->train_hold     = (uint8_t)s->hold_rail;
     st->xing_state     = (uint8_t)s->xing_state;
     st->central_online = (uint8_t)s->central_online;
-    st->override_active= (uint8_t)s->ov_active;
+    st->override_active = (uint8_t)(!s->ov_active ? 0 :
+                                    override_waiting(s) ? 2 : 1);
+    st->override_phase  = (uint8_t)s->ov_phase;
     memcpy(st->veh, s->veh, MV_COUNT);
     memcpy(st->ped, s->ped, PD_COUNT);
     for (i = 0; i < PH_COUNT; i++) {
@@ -331,14 +401,6 @@ static double green_seconds(ictl_t *s, int phase)
         return 1.0;
     }
     return (double)s->green_s[phase];
-}
-
-/* Is an override in force for the phase that is green right now? */
-static int override_holds(const ictl_t *s)
-{
-    return s->ov_active && rts_now_ns() < s->ov_until_ns &&
-           s->ov_phase == s->phase && !s->pre_pending &&
-           (rts_phase_mask(s->phase) & ~rail_block(s)) != 0;
 }
 
 /* Ask t_report to send the full state now, not at the next lamp change. */
@@ -411,14 +473,6 @@ static void hold_green(ictl_t *s, double secs)
     }
 }
 
-/* Does an override want a phase other than the one that is green? */
-static int override_elsewhere(const ictl_t *s)
-{
-    return s->ov_active && rts_now_ns() < s->ov_until_ns &&
-           s->ov_phase != s->phase &&
-           (rts_phase_mask(s->ov_phase) & ~rail_block(s)) != 0;
-}
-
 /*
  * A car reaches the loop of a phase. If that phase is green it drives on,
  * and gets its 5 s to move off before the green can be given up.
@@ -476,11 +530,11 @@ static int next_phase(ictl_t *s)
     int     p = s->phase;
     int     tried;
 
-    /* An override outranks the pattern but not railway pre-emption. */
-    if (s->ov_active && rts_now_ns() < s->ov_until_ns) {
-        if ((rts_phase_mask(s->ov_phase) & ~blocked) != 0) {
-            return s->ov_phase;
-        }
+    /* An override outranks the pattern but not railway pre-emption: one
+       that drives into the rail-side arm waits until the crossing is
+       clear, and the normal hold runs meanwhile. */
+    if (override_wants(s)) {
+        return s->ov_phase;
     }
 
     if (s->pattern == PAT_SENSOR) {
@@ -536,6 +590,11 @@ static void fsm_enter(ictl_t *s, int newstate, const char *note)
 
     s->state = newstate;
 
+    /* Whatever ends a green ends the override's clock with it. */
+    if (newstate != ST_GREEN) {
+        override_green_ends(s);
+    }
+
     switch (newstate) {
     case ST_STARTUP:
         rts_lamps_all_red(s->veh, s->ped);
@@ -564,6 +623,7 @@ static void fsm_enter(ictl_t *s, int newstate, const char *note)
         }
         s->ped_req &= (uint8_t)~ped_mask(s->phase);
         s->car_ns[s->phase] = 0;
+        override_green_begins(s);
         break;
 
     case ST_AMBER:
@@ -731,9 +791,10 @@ static void fsm_reevaluate(ictl_t *s)
         lamps_commit(s, "RAIL: crossing clear, resuming");
     }
 
-    /* An override that has just been set, or has just expired. */
-    if (s->ov_active && rts_now_ns() >= s->ov_until_ns) {
-        s->ov_active = 0;
+    /* An override that has had all the green it was owed. */
+    if (s->ov_active && override_left(s) == 0) {
+        s->ov_active   = 0;
+        s->ov_since_ns = 0;
         rts_log("%s override expired", s->cfg->label);
         lamps_commit(s, "override expired");
     }
@@ -788,7 +849,7 @@ static void *t_phase(void *arg)
              * With random cars on, about one car every ARRIVE_EVERY_S
              * seconds pulls up at a lane picked at random, so a quiet
              * intersection still changes now and then. The control room
-             * can turn that off and place cars by hand instead.
+             * can turn that off, and the VM2 panel places cars by hand.
              */
             if (s->random_cars && rand() % ARRIVE_EVERY_S == 0) {
                 car_arrives(s, rand() % PH_COUNT, "random");
@@ -884,7 +945,6 @@ static void *t_preempt(void *arg)
             changed          = (s->xing_state != rcv.msg.u.xing.state);
             s->xing_state    = rcv.msg.u.xing.state;
             s->xing_last_ns  = rts_now_ns();
-            s->xing_seen     = 1;
             if (changed) {
                 /* The control room shows our view of the crossing, and
                    WARNING -> CLOSED changes no lamp, so send it now. */
@@ -920,7 +980,7 @@ static void *t_preempt(void *arg)
 }
 
 /* ------------------------------------------------------------------ */
-/* t_srv : commands from the control room                              */
+/* t_srv : commands from the control room, presses from the VM2 panel */
 /* ------------------------------------------------------------------ */
 
 /*
@@ -928,12 +988,11 @@ static void *t_preempt(void *arg)
  * break a safety rule is refused and the reason is reported, which is
  * what the brief asks for.
  */
-static int check_pattern(const ictl_t *s, const rts_msg_t *m, uint8_t *why)
+static int check_pattern(const rts_msg_t *m, uint8_t *why)
 {
     int    i;
     double total = 0.0;
 
-    (void)s;
     if (m->u.set_pattern.pattern >= PAT_COUNT) {
         *why = REJ_UNKNOWN_PATTERN;
         return -1;
@@ -1021,7 +1080,7 @@ static void *t_srv(void *arg)
 
         case MSG_SET_PATTERN: {
             uint8_t why;
-            if (check_pattern(s, &rcv.msg, &why) != 0) {
+            if (check_pattern(&rcv.msg, &why) != 0) {
                 rep.result = -1;
                 rep.reason = why;
                 rts_log("%s REJECTED pattern %s: %s", s->cfg->label,
@@ -1054,37 +1113,40 @@ static void *t_srv(void *arg)
 
         case MSG_OVERRIDE:
             if (rcv.msg.u.override_cmd.cancel) {
-                s->ov_active = 0;
+                s->ov_active   = 0;
+                s->ov_since_ns = 0;
+                s->ov_left_ns  = 0;
                 rts_log("%s override cancelled", s->cfg->label);
                 status_now(s);
             } else if (rcv.msg.u.override_cmd.phase >= PH_COUNT) {
                 rep.result = -1;
                 rep.reason = REJ_BAD_PHASE;
-            } else if ((rts_phase_mask(rcv.msg.u.override_cmd.phase) &
-                        ~rail_block(s)) == 0) {
-                /* Railway pre-emption outranks an operator override:
-                   the phase asked for has nothing left to show. A phase
-                   that keeps even one movement away from the tracks is
-                   accepted, and the train still holds the rest red. */
-                rep.result = -1;
-                rep.reason = REJ_PREEMPT_ACTIVE;
-                rts_log("%s REJECTED override: pre-emption active",
-                        s->cfg->label);
             } else {
+                /* Any phase may be held, and a train still comes first:
+                   a phase that drives into the rail-side arm is taken
+                   now and held once the crossing is clear again. */
                 s->ov_active   = 1;
                 s->ov_phase    = rcv.msg.u.override_cmd.phase;
-                s->ov_until_ns = rts_now_ns() +
-                                 rts_ns(rcv.msg.u.override_cmd.timeout_s);
-                rts_log("%s override: hold phase %s for %u s",
+                s->ov_left_ns  = rts_ns(rcv.msg.u.override_cmd.timeout_s);
+                s->ov_since_ns = 0;
+                if (s->state == ST_GREEN) {
+                    override_green_begins(s);
+                }
+                rts_log("%s override: hold phase %s for %u s of green%s",
                         s->cfg->label, rts_phase_name((uint8_t)s->ov_phase),
-                        rcv.msg.u.override_cmd.timeout_s);
-                say(s->cfg->label, A_MAGENTA, "override: hold phase %s",
-                    rts_phase_name((uint8_t)s->ov_phase));
+                        rcv.msg.u.override_cmd.timeout_s,
+                        override_waiting(s) ? " (after the train)" : "");
+                say(s->cfg->label, A_MAGENTA, "override: hold phase %s%s",
+                    rts_phase_name((uint8_t)s->ov_phase),
+                    override_waiting(s) ? " once the crossing is clear"
+                                        : "");
                 status_now(s);
             }
             wake = 1;
             break;
 
+        /* Presses from the VM2 panel: a push button, or a car reaching
+           the loop of a phase. */
         case MSG_PED_BUTTON:
             if (rcv.msg.u.button.ped_id < PD_COUNT) {
                 ped_press(s, rcv.msg.u.button.ped_id);
@@ -1188,7 +1250,7 @@ int intersection_run(const inter_cfg_t *cfg, int argc, char **argv)
 
     /* Sensible defaults so the intersection is safe and useful before
        the control room has ever spoken to it. */
-    G.pattern    = PAT_SENSOR;
+    G.pattern    = PAT_FIXED;  /* the plain cycle until told otherwise */
     G.xing_state = XS_FAULT;   /* until proven otherwise, assume the worst */
     G.hold_rail  = 1;          /* so the tracks are never crossed on trust */
     G.state      = ST_STARTUP;
@@ -1205,8 +1267,12 @@ int intersection_run(const inter_cfg_t *cfg, int argc, char **argv)
         return 1;
     }
 
-    say(cfg->label, "", "crossing %d on the %s arm",
+    say(cfg->label, "", "roads %s (north-south) x %s (east-west), "
+        "crossing X%d on the %s arm", cfg->road_ns, cfg->road_ew,
         cfg->xing_id, rts_arm_name(cfg->rail_arm));
+    rts_log("%s roads %s x %s, crossing X%d on the %s arm", cfg->label,
+            cfg->road_ns, cfg->road_ew, cfg->xing_id,
+            rts_arm_name(cfg->rail_arm));
 
     rts_thread(&th_pre,   t_preempt, &G, PRIO_PREEMPT);
     rts_thread(&th_phase, t_phase,   &G, PRIO_PHASE);

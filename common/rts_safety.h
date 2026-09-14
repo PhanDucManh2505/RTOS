@@ -19,15 +19,10 @@
 #include "rts_proto.h"
 #include <stdint.h>
 
-/* Which phase a movement belongs to. Movements in different phases
-   conflict; movements in the same phase do not. */
-int rts_mv_phase(int mv);
+/* The phase that serves a pedestrian crossing: N and S walk with the
+   east-west traffic in phase C, E and W with the north-south traffic
+   in phase A. */
 int rts_ped_phase(int pd);
-
-/* The two ends of a movement, as arm_t: MV_NW for instance comes from
-   the north arm and leaves by the west one. */
-int rts_mv_from(int mv);
-int rts_mv_to(int mv);
 
 /* Every movement of one phase, as a bitmask of (1u << mv). */
 uint8_t rts_phase_mask(int phase);
@@ -61,12 +56,10 @@ int rts_lamps_safe(const uint8_t veh[MV_COUNT],
 /* Set every vehicle lamp red and every pedestrian lamp DON'T WALK. */
 void rts_lamps_all_red(uint8_t veh[MV_COUNT], uint8_t ped[PD_COUNT]);
 
-/* Give the movements of one phase a colour, everything else stays red. */
-void rts_lamps_phase(uint8_t veh[MV_COUNT], int phase, uint8_t colour);
-
-/* The same, but every movement in 'blocked' is held at red. A phase
-   with some of its movements blocked still runs, it just runs with
-   fewer lamps lit. */
+/* Give the movements of one phase a colour, everything else stays red;
+   every movement in 'blocked' is held at red as well. A phase with
+   some of its movements blocked still runs, it just runs with fewer
+   lamps lit. */
 void rts_lamps_phase_masked(uint8_t veh[MV_COUNT], int phase,
                             uint8_t colour, uint8_t blocked);
 

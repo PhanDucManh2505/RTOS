@@ -29,10 +29,10 @@
 #define T_CAR_MOVE_S         5.0
 
 /* Green times per phase, and the cycle they add up to. */
-#define G_R1_S              20.0    /* phase A, R1 through            */
-#define G_RT1_S             13.0    /* phase B, R1 right turns        */
-#define G_R3_S              20.0    /* phase C, R3 through            */
-#define G_RT3_S             13.0    /* phase D, R3 right turns        */
+#define G_NS_S              20.0    /* phase A, N-S road through      */
+#define G_NS_RT_S           13.0    /* phase B, N-S road right turns  */
+#define G_EW_S              20.0    /* phase C, E-W road through      */
+#define G_EW_RT_S           13.0    /* phase D, E-W road right turns  */
 #define T_CYCLE_S           90.0
 
 /* Limits used when the control room sends new green times. */

@@ -10,6 +10,11 @@
  * stop every train, or let them run again, and it acknowledges every
  * gate fault the railway reports.
  *
+ * The pedestrian push buttons and the car loops are not here either:
+ * they are keys on the VM2 panel (inter_panel.c), beside the
+ * intersections they belong to. What they do still shows up here, in the
+ * status every intersection sends on each lamp change.
+ *
  * Threads, highest priority first:
  *   prio 12  t_srv       receives status from the six intersections and
  *                        crossing state and gate faults from the railway
@@ -27,7 +32,6 @@
 #include "rts_util.h"
 #include "rts_color.h"
 #include "rts_log.h"
-#include "rts_safety.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -45,25 +49,24 @@
 #define PRIO_OP       8
 #define PRIO_DISPLAY  6
 
+/* How much green an override gives the phase it holds. */
+#define OVERRIDE_S   40
+
 typedef struct {
     inter_status_t st;
     int            online;
     int            ever_seen;
-    uint32_t       updates;
-    uint64_t       last_ns;
 } inter_rec_t;
 
 typedef struct {
     xing_status_t st;
     int           online;
-    uint64_t      last_ns;
 } xing_rec_t;
 
 static pthread_mutex_t g_lk;
 static inter_rec_t     g_i[RTS_N_INTERSECTIONS];
 static xing_rec_t      g_x[RTS_N_CROSSINGS];
 static int             g_rail_online;
-static uint64_t        g_rail_last_ns;
 
 static int             g_selected = 1;      /* 0 = all six */
 
@@ -73,7 +76,7 @@ static int             g_selected = 1;      /* 0 = all six */
    reads them, the same as g_selected. */
 #define DRAFT_MAX_S 99
 static int             g_draft[PH_COUNT] = {
-    (int)G_R1_S, (int)G_RT1_S, (int)G_R3_S, (int)G_RT3_S
+    (int)G_NS_S, (int)G_NS_RT_S, (int)G_EW_S, (int)G_EW_RT_S
 };
 static int             g_draft_ph = PH_A;
 
@@ -211,9 +214,7 @@ static void *t_srv(void *arg)
             int id = rcv.msg.u.status.inter_id;
             if (id >= 1 && id <= RTS_N_INTERSECTIONS) {
                 inter_rec_t *r = &g_i[id - 1];
-                r->st        = rcv.msg.u.status;
-                r->last_ns   = rts_now_ns();
-                r->updates++;
+                r->st = rcv.msg.u.status;
                 if (!r->ever_seen) {
                     r->ever_seen = 1;
                     rts_log("I%d reported for the first time", id);
@@ -231,11 +232,9 @@ static void *t_srv(void *arg)
         case MSG_XING_STATE: {
             int id = rcv.msg.u.xing.xing_id;
             if (id >= 1 && id <= RTS_N_CROSSINGS) {
-                g_x[id - 1].st      = rcv.msg.u.xing;
-                g_x[id - 1].online  = 1;
-                g_x[id - 1].last_ns = rts_now_ns();
-                g_rail_online       = 1;
-                g_rail_last_ns      = rts_now_ns();
+                g_x[id - 1].st     = rcv.msg.u.xing;
+                g_x[id - 1].online = 1;
+                g_rail_online      = 1;
             } else {
                 rep.result = -1;
             }
@@ -324,8 +323,7 @@ static void *t_hb(void *arg)
                 }
             } else {
                 pthread_mutex_lock(&g_lk);
-                g_i[i].online  = 1;
-                g_i[i].last_ns = rts_now_ns();
+                g_i[i].online = 1;
                 pthread_mutex_unlock(&g_lk);
             }
         }
@@ -343,8 +341,7 @@ static void *t_hb(void *arg)
             pthread_mutex_unlock(&g_lk);
         } else if (rail.online) {
             pthread_mutex_lock(&g_lk);
-            g_rail_online  = 1;
-            g_rail_last_ns = rts_now_ns();
+            g_rail_online = 1;
             pthread_mutex_unlock(&g_lk);
         }
 
@@ -433,39 +430,19 @@ static void cmd_pattern(int pattern)
     send_selected(&m);
 }
 
-static void cmd_override(int on)
+/* Hold one phase green at the target for OVERRIDE_S seconds of green,
+   or drop the hold. The local controller decides when: a phase that
+   drives into the rail-side arm is held only once any train has gone. */
+static void cmd_override(int phase, int cancel)
 {
     rts_msg_t m;
 
     memset(&m, 0, sizeof(m));
     m.hdr.type                  = MSG_OVERRIDE;
     m.hdr.sender                = SND_CENTRAL;
-    m.u.override_cmd.phase      = PH_A;
-    m.u.override_cmd.timeout_s  = 40;
-    m.u.override_cmd.cancel     = (uint8_t)(on ? 0 : 1);
-    send_selected(&m);
-}
-
-static void cmd_button(int ped_id)
-{
-    rts_msg_t m;
-
-    memset(&m, 0, sizeof(m));
-    m.hdr.type          = MSG_PED_BUTTON;
-    m.hdr.sender        = SND_CENTRAL;
-    m.u.button.ped_id   = (uint8_t)ped_id;
-    send_selected(&m);
-}
-
-/* A car pulls up at the loop of one phase, as a detector would see it. */
-static void cmd_car(int phase)
-{
-    rts_msg_t m;
-
-    memset(&m, 0, sizeof(m));
-    m.hdr.type    = MSG_CAR_REQUEST;
-    m.hdr.sender  = SND_CENTRAL;
-    m.u.car.phase = (uint8_t)phase;
+    m.u.override_cmd.phase      = (uint8_t)phase;
+    m.u.override_cmd.timeout_s  = OVERRIDE_S;
+    m.u.override_cmd.cancel     = (uint8_t)cancel;
     send_selected(&m);
 }
 
@@ -543,18 +520,16 @@ static void *t_op(void *arg)
             if (g_draft[g_draft_ph] < DRAFT_MAX_S) g_draft[g_draft_ph]++;
             break;
 
-        case 'o': cmd_override(1); break;
-        case 'c': cmd_override(0); break;
+        /* Hold one phase green at the target, or drop the hold. */
+        case 'A': cmd_override(PH_A, 0); break;
+        case 'B': cmd_override(PH_B, 0); break;
+        case 'C': cmd_override(PH_C, 0); break;
+        case 'D': cmd_override(PH_D, 0); break;
+        case 'x': cmd_override(0, 1);    break;
 
-        case 'p': cmd_button(PD_N); break;
-        case 'P': cmd_button(PD_E); break;
-
-        /* Off peak requests: a car at the loop of phase A, B, C or D,
-           and random cars on or off at all six. */
-        case '!': cmd_car(PH_A); break;
-        case '@': cmd_car(PH_B); break;
-        case '#': cmd_car(PH_C); break;
-        case '$': cmd_car(PH_D); break;
+        /* Random cars at all six, on or off. The push buttons and the car
+           loops are keys on the VM2 panel; this switch stays here, so a
+           test can take the random traffic away. */
         case 'r':
             g_random = !g_random;
             flash(A_CYAN, "random cars %s at all six intersections",
@@ -587,6 +562,36 @@ static int xing_of(int inter_id)
     return (inter_id + 1) / 2;
 }
 
+/* The two roads of an intersection, as intersection_iN.c names them. R1
+   runs north-south on the west side of the tracks and R2 on the east
+   side, so I1, I3 and I5 are on R1. R3, R4 and R5 run east-west and cross
+   the tracks at X1, X2 and X3, so both intersections of a crossing are on
+   the same one. */
+static int road_ns(int inter_id)
+{
+    return (inter_id % 2 == 1) ? 1 : 2;
+}
+
+static int road_ew(int inter_id)
+{
+    return 2 + xing_of(inter_id);
+}
+
+/* One line under the intersection table: which roads each one joins. The
+   north-south road runs phases A and B, the east-west road C and D. */
+static void draw_roads(rts_frame_t *f)
+{
+    int i;
+
+    rts_frame_add(f, "  %sroads%s", C(A_GREY), C(A_RESET));
+    for (i = 1; i <= RTS_N_INTERSECTIONS; i++) {
+        rts_frame_add(f, "  %sI%d%s R%dxR%d", C(A_WHITE), i, C(A_RESET),
+                      road_ns(i), road_ew(i));
+    }
+    rts_frame_line(f, "   %s(R%d R%d R%d cross the tracks)", C(A_GREY),
+                   road_ew(1), road_ew(3), road_ew(5));
+}
+
 /* One row of the intersection table. Every field has a fixed width on
    screen, and the heading in t_display() uses the same widths. */
 static void draw_inter(rts_frame_t *f, int id, const inter_rec_t *r,
@@ -604,10 +609,15 @@ static void draw_inter(rts_frame_t *f, int id, const inter_rec_t *r,
                        C(A_GREY), "----");
         return;
     }
-    /* An override outranks the pattern, so it takes the column. UPDATED
+    /* An override outranks the pattern, so it takes the column: the
+       phase held, or the phase waiting for a train to pass. UPDATED
        shows the green times the intersection says it is running. */
-    if (st->override_active) {
-        snprintf(pattern, sizeof(pattern), "OVERRIDE");
+    if (st->override_active == 2) {
+        snprintf(pattern, sizeof(pattern), "OVR %s wait",
+                 rts_phase_name(st->override_phase));
+    } else if (st->override_active) {
+        snprintf(pattern, sizeof(pattern), "OVERRIDE %s",
+                 rts_phase_name(st->override_phase));
     } else if (st->pattern == PAT_UPDATED) {
         snprintf(pattern, sizeof(pattern), "%u/%u/%u/%u",
                  (unsigned)st->green_s[PH_A], (unsigned)st->green_s[PH_B],
@@ -628,7 +638,8 @@ static void draw_inter(rts_frame_t *f, int id, const inter_rec_t *r,
         C(A_GREY), xing_of(id), C(A_RESET),
         rts_xing_color(st->xing_state), rts_xing_name(st->xing_state),
         C(A_RESET),
-        st->override_active ? C(A_MAGENTA) : "", pattern, C(A_RESET),
+        st->override_active == 2 ? C(A_AMBER)
+            : st->override_active ? C(A_MAGENTA) : "", pattern, C(A_RESET),
         st->train_hold ? C(A_BG_RED) : "",
         st->train_hold ? " RAIL HOLD " : "");
 }
@@ -748,9 +759,9 @@ static void *t_display(void *arg)
         for (i = 0; i < RTS_N_INTERSECTIONS; i++) {
             draw_inter(&f, i + 1, &ir[i], sel == 0 || sel == i + 1);
         }
-        rts_frame_line(&f, "  %sA = R1 through   B = R1 right turn   "
-                       "C = R3 through   D = R3 right turn   "
-                       "(R3 crosses the tracks)", C(A_GREY));
+        rts_frame_line(&f, "  %sA = N-S through   B = N-S right turn   "
+                       "C = E-W through   D = E-W right turn", C(A_GREY));
+        draw_roads(&f);
         rts_frame_line(&f, "");
 
         rts_frame_line(&f, "  %s%-3s  %-7s  %-6s  %-6s  %-6s  %-6s  %-6s",
@@ -768,8 +779,8 @@ static void *t_display(void *arg)
             rts_frame_line(&f, "");
         }
 
-        /* The key rows follow straight on: the window is 24 rows and the
-           panel has to stay inside 23 of them. */
+        /* The key rows follow straight on, so the panel stays inside the
+           24 rows of the window. */
         rts_frame_add(&f, "  %s%-9s%s%s%-5s%s", C(A_GREY), "TARGET",
                       C(A_RESET), C(A_CYAN), target, C(A_RESET));
         rts_frame_key(&f, "1-6", "pick one");
@@ -781,11 +792,8 @@ static void *t_display(void *arg)
         rts_frame_keys(&f, 9, "PATTERN", "f", "fixed", "s", "sensor",
                        "u", "updated, times below", NULL);
         draw_draft(&f);
-        rts_frame_keys(&f, 9, "COMMAND", "o", "override, hold A",
-                       "c", "cancel", NULL);
-        rts_frame_keys(&f, 9, "SENSOR", "p", "ped N", "P", "ped E",
-                       "!", "car A", "@", "car B", "#", "car C",
-                       "$", "car D", "r",
+        rts_frame_keys(&f, 9, "COMMAND", "A", "hold A", "B", "hold B",
+                       "C", "hold C", "D", "hold D", "x", "cancel", "r",
                        g_random ? "random cars ON" : "random cars OFF", NULL);
         rts_frame_add(&f, "  %s%-9s%s", C(A_GREY), "RAILWAY", C(A_RESET));
         rts_frame_key(&f, "e", "stop all trains");

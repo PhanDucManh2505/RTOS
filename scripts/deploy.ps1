@@ -26,11 +26,12 @@ if (-not $SkipBuild) {
 }
 
 $targets = @(
-    @{ ip = $VM1; files = @("central") ; script = "run_vm1.sh" },
+    @{ ip = $VM1; files = @("central") ; scripts = @("run_vm1.sh") },
     @{ ip = $VM2; files = @("intersection_i1","intersection_i2","intersection_i3",
-                            "intersection_i4","intersection_i5","intersection_i6")
-       script = "run_vm2.sh" },
-    @{ ip = $VM3; files = @("railway") ; script = "run_vm3.sh" }
+                            "intersection_i4","intersection_i5","intersection_i6",
+                            "inter_panel")
+       scripts = @("run_vm2.sh", "run_vm2_panel.sh") },
+    @{ ip = $VM3; files = @("railway") ; scripts = @("run_vm3.sh") }
 )
 
 foreach ($t in $targets) {
@@ -39,7 +40,9 @@ foreach ($t in $targets) {
     foreach ($f in $t.files) {
         scp "$root/bin/$f" "root@$($t.ip):$Dir/"
     }
-    scp "$root/scripts/$($t.script)" "root@$($t.ip):$Dir/"
+    foreach ($s in $t.scripts) {
+        scp "$root/scripts/$s" "root@$($t.ip):$Dir/"
+    }
     scp "$root/scripts/start_qnet.sh" "root@$($t.ip):$Dir/"
     ssh "root@$($t.ip)" "chmod +x $Dir/*"
 }

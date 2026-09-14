@@ -30,6 +30,7 @@ enum {
     SND_CENTRAL = 1,
     SND_I1 = 11, SND_I2 = 12, SND_I3 = 13,
     SND_I4 = 14, SND_I5 = 15, SND_I6 = 16,
+    SND_PANEL   = 20,             /* inter_panel, the screen and keys of VM2 */
     SND_RAILWAY = 30
 };
 
@@ -45,22 +46,20 @@ enum {
 #define MSG_HEARTBEAT     (MSG_BASE + 1)   /* central -> intersection / railway */
 #define MSG_SET_PATTERN   (MSG_BASE + 2)   /* central -> intersection           */
 #define MSG_OVERRIDE      (MSG_BASE + 3)   /* central -> intersection           */
-#define MSG_PED_BUTTON    (MSG_BASE + 4)   /* central -> intersection           */
+#define MSG_PED_BUTTON    (MSG_BASE + 4)   /* VM2 panel -> intersection         */
 #define MSG_STATUS        (MSG_BASE + 6)   /* intersection -> central           */
 #define MSG_XING_STATE    (MSG_BASE + 7)   /* railway -> intersection / central */
 #define MSG_RAIL_CMD      (MSG_BASE + 8)   /* central -> railway                */
 #define MSG_GATE_FAULT    (MSG_BASE + 9)   /* railway -> central                */
-#define MSG_CAR_REQUEST   (MSG_BASE + 10)  /* central -> intersection           */
+#define MSG_CAR_REQUEST   (MSG_BASE + 10)  /* VM2 panel -> intersection         */
 
 /* ------------------------------------------------------------------ */
 /* Pulse codes (a pulse carries one byte of code and four of value)    */
 /* ------------------------------------------------------------------ */
 #define PULSE_PHASE_TICK    (_PULSE_CODE_MINAVAIL + 1)
-#define PULSE_PED_TICK      (_PULSE_CODE_MINAVAIL + 2)
 #define PULSE_SENSOR_TICK   (_PULSE_CODE_MINAVAIL + 3)
 #define PULSE_WAKE          (_PULSE_CODE_MINAVAIL + 4)
 #define PULSE_XING_CHANGED  (_PULSE_CODE_MINAVAIL + 5)
-#define PULSE_WATCHDOG      (_PULSE_CODE_MINAVAIL + 6)
 
 /* ------------------------------------------------------------------ */
 /* Lights                                                              */
@@ -75,10 +74,10 @@ typedef enum { PED_DONT = 0, PED_WALK = 1, PED_FLASH = 2 } pedlamp_t;
  * opposing stream (Australian rules, traffic keeps left).
  */
 enum {
-    MV_NS = 0, MV_SN,          /* through movements on R1 (the vertical road) */
-    MV_EW,     MV_WE,          /* through movements on R3 (the rail-side road) */
-    MV_NW,     MV_SE,          /* right turns out of R1 */
-    MV_WS,     MV_EN,          /* right turns out of R3 */
+    MV_NS = 0, MV_SN,          /* through on the north-south road (R1 or R2) */
+    MV_EW,     MV_WE,          /* through on the east-west road (R3, R4, R5) */
+    MV_NW,     MV_SE,          /* right turns out of the north-south road */
+    MV_WS,     MV_EN,          /* right turns out of the east-west road */
     MV_COUNT
 };
 
@@ -95,12 +94,14 @@ enum { PD_N = 0, PD_S, PD_E, PD_W, PD_COUNT };
 
 /*
  * Phases. The order never changes: A -> B -> C -> D -> A.
- *   A : R1 through   + pedestrians on the E and W arms
- *   B : R1 right turns, no pedestrians
- *   C : R3 through   + pedestrians on the N and S arms
- *   D : R3 right turns, no pedestrians
- * R3 is the road that runs over the railway tracks, so phases C and D
- * are the ones that must be shut down when a train is coming.
+ *   A : north-south road through   + pedestrians on the E and W arms
+ *   B : north-south road right turns, no pedestrians
+ *   C : east-west road through     + pedestrians on the N and S arms
+ *   D : east-west road right turns, no pedestrians
+ * Each intersection has its own pair of roads (inter_cfg_t): R1 or R2
+ * north-south, beside the tracks, and R3, R4 or R5 east-west, over them.
+ * Which movements a train holds back is worked out movement by movement,
+ * see rts_rail_block_mask().
  */
 typedef enum { PH_A = 0, PH_B, PH_C, PH_D, PH_COUNT } phase_t;
 
@@ -116,7 +117,8 @@ typedef enum {
 
 /* Light sequence patterns the central controller can select. */
 typedef enum {
-    PAT_FIXED = 0,    /* peak hour: fixed times, pedestrian buttons ignored */
+    PAT_FIXED = 0,    /* peak hour: fixed times, pedestrian buttons ignored;
+                         what every intersection starts on               */
     PAT_SENSOR,       /* off peak: react to vehicle demand and to buttons   */
     PAT_UPDATED,      /* advanced: green times supplied by the control room */
     PAT_COUNT
@@ -151,7 +153,6 @@ enum {
     REJ_CYCLE_TOO_LONG,
     REJ_CONFLICT,
     REJ_BAD_PHASE,
-    REJ_PREEMPT_ACTIVE,
     REJ_RAIL_ENTRY,     /* would drive into the arm the tracks cross */
     REJ_COUNT
 };
@@ -178,8 +179,9 @@ typedef struct {
     uint8_t  train_hold;           /* 1 = rail road is being held red  */
     uint8_t  xing_state;           /* what this controller last read   */
     uint8_t  central_online;       /* 1 = heartbeat is arriving        */
-    uint8_t  override_active;
-    uint8_t  pad0;
+    uint8_t  override_active;      /* 0 none, 1 holding, 2 waiting for
+                                      a train to pass                  */
+    uint8_t  override_phase;       /* phase_t, the phase held          */
     uint16_t green_s[PH_COUNT];    /* green time in force per phase    */
 } inter_status_t;
 
@@ -211,7 +213,7 @@ typedef struct {
         struct {
             uint8_t  phase;                /* phase group to hold green */
             uint8_t  cancel;               /* 1 = drop the override     */
-            uint16_t timeout_s;
+            uint16_t timeout_s;            /* green to give it, in s    */
         } override_cmd;
 
         struct { uint8_t ped_id; } button; /* PD_N .. PD_W */
@@ -246,7 +248,6 @@ typedef union {
     rts_msg_t     msg;
 } rts_rcv_t;
 
-const char *rts_lamp_name(uint8_t lamp);
 const char *rts_phase_name(uint8_t phase);
 const char *rts_state_name(uint8_t state);
 const char *rts_pattern_name(uint8_t pattern);

@@ -13,7 +13,7 @@ mutexes with priority inheritance, and condition variables.
 | Node | Hostname | Processes | Role |
 |---|---|---|---|
 | VM1 | `vm1` | `central` | Control room. Monitors everything, sends pattern and override commands, can stop every train and acknowledges gate faults. Never drives a lamp, a train or a gate. |
-| VM2 | `vm2` | `intersection_i1` … `intersection_i6` | Six independent local controllers, one process each. Each owns its own lamps and its own timing. |
+| VM2 | `vm2` | `intersection_i1` … `intersection_i6`, `inter_panel` | Six independent local controllers, one process each. Each owns its own lamps and its own timing. `inter_panel` is VM2's screen and keyboard: it shows what the six print in a table that scrolls with the mouse wheel, and its keys stand in for the pedestrian push buttons and the car loop detectors. It controls nothing; the six run the same without it. |
 | VM3 | `vm3` | `railway` | Three level crossings, the boom gates, the train line and the fault reporting. |
 
 Crossings are shared between pairs:
@@ -27,11 +27,26 @@ enter at either end: a southbound (NS) train enters at X1 on track A and is
 detected at X2 60 s later and at X3 90 s after that; a northbound (SN) train
 enters at X3 on track B and runs the other way (`rts_timing.h`).
 
-Each intersection is a crossroads of two roads: R1 on the north-south arms and
-R3 on the east-west ones. The railway runs parallel to R1 and cuts R3 about 50 m
-from the stop line. Because the crossing sits *between* the two controllers of a
-pair, it is on opposite arms of them: the tracks cross the **east** arm of I1, I3
-and I5 and the **west** arm of I2, I4 and I6 (`inter_cfg_t.rail_arm`).
+Each intersection is a crossroads of a north-south road and an east-west road.
+The two north-south roads, R1 and R2, run parallel to the railway, one on each
+side of it; the three east-west roads, R3, R4 and R5, cross it at X1, X2 and X3,
+about 50 m from the stop line on either side. Because the crossing sits
+*between* the two controllers of a pair, it is on opposite arms of them: the
+tracks cross the **east** arm of I1, I3 and I5 and the **west** arm of I2, I4
+and I6.
+
+| Intersection | North-south road (phases A, B) | East-west road (phases C, D) | Tracks cross its | Crossing |
+|---|---|---|---|---|
+| I1 | R1 | R3 | east arm | X1 |
+| I2 | R2 | R3 | west arm | X1 |
+| I3 | R1 | R4 | east arm | X2 |
+| I4 | R2 | R4 | west arm | X2 |
+| I5 | R1 | R5 | east arm | X3 |
+| I6 | R2 | R5 | west arm | X3 |
+
+Each `intersection_iN.c` sets its row of this table in its `inter_cfg_t`
+(`road_ns`, `road_ew`, `rail_arm`, `xing_id`); central shows the roads on the
+line under its intersection table.
 
 ```
         N                      the tracks cross the east arm of I1:
@@ -51,7 +66,7 @@ different machine never requires a rebuild.
 
 ```
 rts_traffic/
-  Makefile                     builds all 8 executables into bin/
+  Makefile                     builds all 9 executables into bin/
   common/
     rts_proto.h  rts_proto.c   message types, structs, enums, name helpers
     rts_names.h  rts_names.c   node names, service names, /net path building
@@ -64,11 +79,14 @@ rts_traffic/
   src/
     central.c                  VM1
     intersection_i1.c … i6.c   VM2, one main() and one executable each
+    inter_panel.c              VM2, the screen and the keys beside the six
     railway.c                  VM3
   scripts/
     start_qnet.sh              bring Qnet up on a target
     run_vm1.sh  run_vm2.sh  run_vm3.sh
+    run_vm2_panel.sh           VM2 with its panel, which reads the six's output from a FIFO
     deploy.ps1                 build on Windows and scp to all three VMs
+    deploy_via_vm1.sh          push a build from VM1 to VM2 and VM3 over Qnet, when only VM1 takes key login
 ```
 
 The six intersection files each have their own `main()` and build into their own
@@ -87,7 +105,7 @@ crossing it sits next to. Six copies of the same
 |---|---|---|---|
 | 21 | `t_preempt` | `rts_iN_evt` channel | Crossing state from the railway node, plus the crossing watchdog. |
 | 15 | `t_phase` | private channel | Timer pulses, runs the light state machine, the **only** writer of the lamps. |
-| 12 | `t_srv` | `rts_iN` channel | Commands from the control room; validates, accepts or refuses. |
+| 12 | `t_srv` | `rts_iN` channel | Commands from the control room and presses from the VM2 panel; validates, accepts or refuses. |
 | 10 | `t_report` | condition variable | Sends a status message on every lamp change. |
 | 5 | log writer | condition variable | Drains the log ring buffer into `/fs`. |
 
@@ -108,6 +126,8 @@ keep a burst of status traffic from delaying a reaction to a train.
 
 **Central** (`central`): `t_srv` 12, `t_hb` 10, `t_op` 8, `t_display` 6, log writer 5.
 
+**VM2 panel** (`inter_panel`): `t_lines` 10, `t_op` 8, `t_display` 6, log writer 5. `t_lines` sits above the rest so a controller is never kept waiting on a full FIFO.
+
 ---
 
 ## 4. IPC map
@@ -117,6 +137,8 @@ keep a burst of status traffic from delaying a reaction to a train.
 | central ↔ each intersection (commands, heartbeat, status) | native message passing over Qnet | Synchronous: one call tells the sender whether the message was accepted, refused, or never arrived. The reply doubles as proof the receiver is alive. |
 | railway → intersections and central (crossing state) | native message passing over Qnet, pushed on change and repeated once a second | Qnet cannot carry shared memory, so the crossing state is pushed rather than published. See §8. |
 | central → railway (stop or release the trains, acknowledge a gate fault) | native message passing over Qnet | The only way the control room reaches the railway, and it cannot drive a train or a gate through it. No traffic-light process is on this path. |
+| VM2 panel → each intersection (push button, car on a loop) | native message passing, local on VM2 | The same call as a command: the reply says whether the controller took the press. The panel stands in for equipment beside the road, so it runs on the intersections' node. |
+| six intersections → VM2 panel (their screen output) | a FIFO, one whole line per write | Only text for the operator. The controllers ignore `SIGPIPE`, so a panel that stops costs the picture, never the lights. |
 | POSIX timers → `t_phase` | pulses | Non-blocking and fixed size. A timer must never hold up the thread it fires into. |
 | `t_preempt` / `t_srv` → `t_phase` ("look again") | pulses | Same reason: the sender is never blocked by the state machine. |
 | any thread → log writer | ring buffer, mutex + condition variable | Asynchronous, so nothing waits on the file system. |
@@ -133,9 +155,9 @@ call itself is identical either way.
 |---|---|---|---|
 | `MSG_HEARTBEAT` | central → intersection, railway | once a second | the random cars switch; the reply is the point |
 | `MSG_SET_PATTERN` | central → intersection | operator or schedule | pattern id, four green times |
-| `MSG_OVERRIDE` | central → intersection | dignitary or emergency | phase to hold green, timeout |
-| `MSG_PED_BUTTON` | central → intersection | operator injects a press | which crossing |
-| `MSG_CAR_REQUEST` | central → intersection | operator places a car on a loop | which phase |
+| `MSG_OVERRIDE` | central → intersection | dignitary or emergency | phase to hold green, seconds of green to give it |
+| `MSG_PED_BUTTON` | VM2 panel → intersection | someone presses a push button (`p` `P`) | which crossing |
+| `MSG_CAR_REQUEST` | VM2 panel → intersection | a car reaches a loop detector (`!` `@` `#` `$`) | which phase |
 | `MSG_STATUS` | intersection → central | **every lamp change** | all lamps, phase, pattern, hold, link state |
 | `MSG_XING_STATE` | railway → 2 intersections + central | on change, and every second | CLEAR / WARNING / CLOSED / FAULT, tracks, gates, train signal |
 | `MSG_RAIL_CMD` | central → railway | operator stops or releases the trains; every gate fault report | stop, release, or fault acknowledged at a crossing |
@@ -184,7 +206,14 @@ a train on it. A controller **starts** in that held state and only releases the
 movements into the rail-side arm once the railway has reported `CLEAR`.
 
 Priority of intent, highest first: railway pre-emption → operator override →
-selected pattern → the normal cycle.
+selected pattern → the normal cycle. An override holds any one of the four
+phases for 40 s of green: the clock runs only while that phase shows green,
+so a train that cuts it pauses the clock rather than eating it. An override
+for a phase that drives into the rail-side arm (C or B, depending on the
+side) gives way completely: while the crossing is not clear the normal
+rail hold runs and the override waits (central shows `OVR C wait`); it is
+held only once the train has gone. A phase that never touches that arm
+(A, D) resumes straight after the clearing green.
 
 **Off peak (SENSOR) there is no cycle.** A green stays up indefinitely and is
 only given up when another phase has asked for it and whoever asked for this
@@ -193,7 +222,7 @@ can then go to any
 phase, not only the next one: pedestrians first, the earliest button, then
 vehicles, the earliest car on its loop. Cars turn up at random, about one per
 intersection every 30 s, unless the control room turns that off (`r`); `!` `@`
-`#` `$` place one by hand.
+`#` `$` on the VM2 panel place one by hand.
 
 Commands are validated locally before use. `check_pattern()` refuses a green
 below the pedestrian minimum, above the maximum, or a cycle that is too long,
@@ -244,14 +273,14 @@ make VARIANT=gcc_ntox86_64_gpp
 2. **File → New → Project… → C/C++ → Makefile Project with Existing Code**.
 3. *Existing Code Location*: the `rts_traffic` folder. *Toolchain*: **QNX
    Qcc**. Finish.
-4. **Project → Build All**. The eight executables appear in `bin/`.
+4. **Project → Build All**. The nine executables appear in `bin/`.
 5. Add the three targets in the **QNX Target Navigator** (right-click → *New QNX
    Target*), one per VM. `qconn` must be running on each — note that restarting
    `io-pkt` for Qnet also kills `qconn`, so `start_qnet.sh` restarts it.
 
-A Makefile project is used rather than eight managed projects because the brief
-asks for one project containing separate programs, and eight separate build
-configurations would be eight places to keep in step.
+A Makefile project is used rather than nine managed projects because the brief
+asks for one project containing separate programs, and nine separate build
+configurations would be nine places to keep in step.
 
 ---
 
@@ -327,6 +356,18 @@ Set `RTS_COLOR=0` on the target if you want to capture plain text.
 .\scripts\deploy.ps1 -VM1 192.168.56.110 -VM2 192.168.56.111 -VM3 192.168.56.112
 ```
 
+Only VM1 accepts key login. When `deploy.ps1` cannot reach VM2 or VM3, push
+the build through VM1 instead: `deploy_via_vm1.sh` runs on VM1, keeps the
+binaries it replaces in `bak_<tag>` on every node and copies the new ones
+over Qnet. Stop the system first (`.\scriptsts_stop.ps1`); a running binary
+cannot be overwritten.
+
+```powershell
+ssh root@192.168.56.110 mkdir -p /tmp/manh/new
+scp bin\* scripts\deploy_via_vm1.sh scriptsun_vm2*.sh root@192.168.56.110:/tmp/manh/new/
+ssh root@192.168.56.110 sh /tmp/manh/new/deploy_via_vm1.sh my_tag
+```
+
 Start in this order — VM3 first so the intersections learn the crossing state
 straight away, VM1 last:
 
@@ -334,8 +375,8 @@ straight away, VM1 last:
 # VM3
 cd /tmp/manh && ./run_vm3.sh
 
-# VM2
-cd /tmp/manh && ./run_vm2.sh
+# VM2: the six controllers and their panel
+cd /tmp/manh && ./run_vm2_panel.sh
 
 # VM1
 cd /tmp/manh && ./run_vm1.sh
@@ -350,14 +391,35 @@ reports in.
 | Key | Effect |
 |---|---|
 | `1`–`6` | pick one intersection · `0` all six |
-| `f` `s` `u` | pattern: fixed (peak) · sensor-driven (off-peak) · updated, sending the green times on the UPDATED row |
+| `f` `s` `u` | pattern: fixed (peak) · sensor-driven (off-peak) · updated, sending the green times on the UPDATED row. Every intersection starts on fixed. |
 | `[` `]` `-` `+` | UPDATED row: pick phase A–D · take 1 s off its green · add 1 s. The row starts at the programmed 20/13/20/13 and nothing is sent until `u`. A green under 8 s (or over 60 s, or a cycle over 150 s) shows red, and the intersection refuses the whole update and keeps running what it had. Accepted times stay in force until another pattern is chosen, and the PATTERN column shows them as A/B/C/D. |
-| `o` `c` | override: hold phase A green · cancel |
-| `p` `P` | inject a pedestrian button press (north arm, phase C · east arm, phase A) |
-| `!` `@` `#` `$` | a car pulls up at the loop of phase A · B · C · D |
-| `r` | random cars on or off at all six intersections (shown on the SENSOR row) |
+| `A` `B` `C` `D` `x` | override: hold that phase green at the target for 40 s of green · cancel. The PATTERN column shows `OVERRIDE C`, or `OVR C wait` while a train has the crossing and the hold is postponed. Pressing another letter ends the held phase with its full amber and all-red, then holds the new one; pressing the same letter again gives it a fresh 40 s. |
+| `r` | random cars on or off at all six intersections, for testing (shown on the COMMAND row). The pedestrian buttons and the car loops are on the VM2 panel. |
 | `e` `E` | tell the railway to stop every train (something is wrong on the line) · let them run again. The RAILWAY row shows `trains STOPPED` or `trains running`. Central cannot put a train on the line or move a gate: those keys are on the railway. Every gate fault the railway reports is acknowledged automatically. |
 | `q` | quit |
+
+### Keys — intersection panel (VM2)
+
+The VM2 window is a panel like the railway's. Its table holds the last 500
+lines the six controllers printed; the mouse wheel scrolls it back, and
+scrolling down to the bottom follows the newest lines again. A line from the
+intersection the keys act on is marked in its first column.
+
+The panel's target is its own: picking an intersection here does not change the
+control room's target, nor the other way round. A press is a message to the
+controller, which decides what to do with it, so its effect shows up on
+central's table like any other lamp change.
+
+| Key | Effect |
+|---|---|
+| `1`–`6` | pick one intersection · `0` all six (TARGET row) |
+| `p` `P` | a pedestrian presses the button on the north arm (phase C) · on the east arm (phase A) |
+| `!` `@` `#` `$` | a car pulls up at the loop of phase A · B · C · D |
+
+The SELECT row shows an intersection in red when it did not answer the last
+press. There is no `q`: the panel stops with the rest of VM2
+(`./run_vm2.sh stop`), and if it stops on its own the six carry on without a
+picture.
 
 ### Keys — railway (VM3)
 
@@ -365,7 +427,7 @@ reports in.
 |---|---|
 | `1` `2` `3` | select the crossing the gate keys act on |
 | `a` `b` | a train enters at X1 and runs X1 → X2 → X3 on track A · enters at X3 and runs X3 → X2 → X1 on track B. There is no way to put a train on X2. |
-| `n` `r` `o` | timetable: no trains (late night) · rush hour, a train every 2 min · off peak, every 4 min. Timetabled trains alternate NS, SN, NS … |
+| `n` `r` `o` | timetable: no trains (late night) · rush hour, a train every 2 min · off peak, every 4 min. The railway starts with none; a timetable picked later sends its first train one interval after the key. Timetabled trains alternate NS, SN, NS … |
 | `f` `c` | inject a gate fault · clear it |
 | `q` | quit |
 
@@ -377,18 +439,18 @@ Run at `-s 5`. Each scenario is one claim you can be asked to back up.
 
 | # | Scenario | Do this | What must happen | Grade band |
 |---|---|---|---|---|
-| 1 | Safe sequence | Central `0` then `f`, and watch any intersection for two cycles | A → B → C → D, every green followed by 4 s amber then 2 s all-red. No two phase groups ever green together. | Pass |
-| 2 | Distributed | `pidin` on VM2 shows six processes; central shows all six | Six independent processes on one node, three nodes joined by Qnet | Pass |
+| 1 | Safe sequence | Straight after start (every intersection starts on FIXED), or central `0` then `f`; watch any intersection for two cycles | A → B → C → D, every green followed by 4 s amber then 2 s all-red. No two phase groups ever green together. | Pass |
+| 2 | Distributed | `pidin` on VM2 shows the six controllers (and `inter_panel`); central shows all six | Six independent controller processes on one node, three nodes joined by Qnet | Pass |
 | 3 | Railway pre-emption | Railway `a` (a train enters at X1) | I1 and I2 cut the current green, run amber + all-red in full, then a clearing green for the movement that comes out of the rail-side arm only (`EW` at I1). Central shows `RAIL HOLD`. The same train reaches X2 60 s later (I3, I4) and X3 90 s after that (I5, I6). | Pass |
 | 4 | Two trains | Railway `b`, then `a` 30 s later | They meet at X2, one on each track: its gates stay down while either track is occupied and only rise when both are clear | HD |
-| 5 | Off peak holds, any phase next | Central `s`, `r` (random cars off), then `$` | The intersection goes straight to phase D, whatever phase it was on, and then stays on D indefinitely: nothing asks, so nothing changes. | Credit |
-| 6 | Pedestrians first | Still with random cars off, press `P`, `@`, `p` quickly | A for the east pedestrian, held 18 s, then C for the north one, 18 s, and only then B for the car that asked before them. The crossings walk with their phase and flash through its amber. | Credit |
+| 5 | Off peak holds, any phase next | Central `s`, `r` (random cars off), then `$` on the VM2 panel | The intersection goes straight to phase D, whatever phase it was on, and then stays on D indefinitely: nothing asks, so nothing changes. | Credit |
+| 6 | Pedestrians first | Still with random cars off, press `P`, `@`, `p` quickly on the VM2 panel | A for the east pedestrian, held 18 s, then C for the north one, 18 s, and only then B for the car that asked before them. The crossings walk with their phase and flash through its amber. | Credit |
 | 7 | Monitoring | Watch the central dashboard | A status message on every lamp change, all six intersections and three crossings live | Credit |
 | 8 | Pattern change | Central `0` then `f`, then `s` | All six accept and change at the end of the cycle | Distinction |
 | 9 | Updateable pattern | Central `u` | New green times supplied by the control room, validated locally, then applied | HD |
 | 10 | Command refused | Central: take a phase under 8 s on the UPDATED row, then `u` | Refused with "green below the safe minimum". The lights and the green times in force do not change. | HD |
-| 11 | Override | Central `o`, then `c` | Phase A is held green, then the normal cycle resumes | HD |
-| 12 | Pre-emption outranks override | `o`, then send a train | The override is refused or suspended; the train wins | HD |
+| 11 | Override | Central `1` `C`, wait 40 s; then `B`, then `x` | Phase C is held green for 40 s of green and expires on its own; B is held next; `x` drops the hold and the normal cycle resumes | HD |
+| 12 | Pre-emption outranks override | `1` `C`, then send a train | C is cut with its full amber and all-red, the clearing green and the rail hold run as if there were no override (`OVR C wait`), and C is held again, for the green it is still owed, only once X1 is clear | HD |
 | 13 | Boom gate fault | Railway `f` | Gate never reaches position → `FAULT`, train given a **red**, control room told and it acknowledges straight away (railway event list), both controllers hold the tracks clear | HD |
 | 14 | Central controller fails | `q` on VM1, or `slay central` | All six keep cycling on their last valid pattern, mark the link down within 3 s, and write status to `/fs`. Restart it: they resync. | HD |
 | 15 | Node fails | On VM3, `slay railway` | Within the watchdog, both controllers on each crossing treat it as `FAULT` and hold. Restart it: they release. | HD |
@@ -399,11 +461,6 @@ Run at `-s 5`. Each scenario is one claim you can be asked to back up.
 
 For scenario 14, `q` on the central terminal is the clean way; `slay central`
 from a second SSH session proves the same thing without a graceful shutdown.
-
-Every scenario above is also checked automatically: `scripts/test/` drives the
-three VMs over SSH, presses the same keys, and reads back the screens and the
-logs. `python scripts/test/rts_tests.py` prints one
-PASS or FAIL line per claim; `scripts/test/README.md` explains the groups.
 
 ---
 
@@ -419,5 +476,4 @@ PASS or FAIL line per claim; `scripts/test/README.md` explains the groups.
 | "How do you avoid priority inversion" | `rts_util.c` → `rts_mutex_init()` with `PTHREAD_PRIO_INHERIT` |
 | "What if a node disappears" | `rts_util.c` → `TimerTimeout()` before every `MsgSend()`; watchdog in `t_phase` |
 | "What exactly does a train stop" | `rts_safety.c` → `rts_rail_block_mask()`, applied in `fsm_enter()` and re-checked in `lamps_commit()` |
-| "How do you prove any of this" | `scripts/test/rts_tests.py`, one check per claim, run against the three VMs |
 | "Why three threads" | header comment in `intersection_core.h` |
