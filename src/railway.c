@@ -241,7 +241,7 @@ static void state_event(const xing_status_t *st, int from)
         break;
     case XS_CLEAR:
         if (from == XS_FAULT) {
-            event(A_GREEN, "X%d CLEAR    fault cleared, gates going up", id);
+            event(A_GREEN, "X%d CLEAR    fault cleared", id);
         } else {
             event(A_GREEN, "X%d CLEAR    gates up, road open", id);
         }

@@ -42,8 +42,9 @@
 
 /* Railway pre-emption. */
 #define T_WARNING_S         30.0    /* notice the rail system must give   */
-#define T_RAIL_CLEAR_PEAK_S 21.0    /* green needed to empty 50 m of road */
-#define T_RAIL_CLEAR_OFF_S   6.0    /* off peak the buffer is nearly empty */
+#define T_RAIL_CLEAR_S      21.0    /* green needed to empty 50 m of road at
+                                       peak, used on every pattern so both
+                                       sides of a crossing hold together  */
 #define T_GATE_MOVE_S        4.0    /* how long a healthy boom gate takes  */
 #define T_GATE_TIMEOUT_S     8.0    /* no movement by now means a fault    */
 #define T_TRAIN_OCCUPY_S    15.0    /* how long a train sits on the crossing */

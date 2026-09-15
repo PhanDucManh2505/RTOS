@@ -75,6 +75,7 @@ typedef struct {
     int      hold_rail;       /* 1 = phases C and D are shut down      */
     int      pre_pending;     /* 1 = pre-emption asked for, not done   */
     int      pre_done;        /* 1 = the clearing green has been given */
+    uint64_t pre_ns;          /* when this pre-emption was asked for   */
 
     /* One loop detector per phase. 0 means nobody is on it, anything
        else is when the car waiting there arrived. Used by the sensor
@@ -659,8 +660,11 @@ static void fsm_enter(ictl_t *s, int newstate, const char *note)
         rts_lamps_phase_masked(s->veh, s->phase, LAMP_GREEN,
                                s->green_mask);
         memset(s->ped, PED_DONT, PD_COUNT);
-        secs = (s->pattern == PAT_FIXED) ? T_RAIL_CLEAR_PEAK_S
-                                         : T_RAIL_CLEAR_OFF_S;
+        /* The same length on every pattern. The two intersections
+           beside a crossing may run different patterns and know nothing
+           of each other's, and a shorter green on one of them would put
+           them into the rail hold at different moments. */
+        secs = T_RAIL_CLEAR_S;
         break;
 
     default:
@@ -671,6 +675,20 @@ static void fsm_enter(ictl_t *s, int newstate, const char *note)
 
     rts_timer_once(tmr_phase, rts_ms(secs));
     lamps_commit(s, note);
+}
+
+/*
+ * When the railway clearing green may begin: a fixed time after the
+ * pre-emption was asked for, the amber and all-red that a green cut short
+ * at that moment runs. An intersection the train found already in amber
+ * or all-red stays all red until then, so the two intersections beside a
+ * crossing start the clearing green, and later the rail hold, together,
+ * wherever the train found each of them in its own cycle. This is the
+ * worst case the pre-emption budget already counts on: 4 + 2 + 21 < 30 s.
+ */
+static uint64_t pre_clear_due(const ictl_t *s)
+{
+    return s->pre_ns + rts_ns(T_AMBER_S + T_ALLRED_S);
 }
 
 /* Keep the current green one more second, then look again. */
@@ -738,6 +756,19 @@ static void fsm_advance(ictl_t *s)
                ask for a second pre-emption during this clearing green,
                and that stale request ran a second clearing green after
                the train had already gone. */
+            uint64_t now = rts_now_ns();
+            uint64_t due = pre_clear_due(s);
+
+            if (now + 1000000ULL < due) {
+                /* Caught in amber or all-red: stay all red until the
+                   clearing green is due, so the intersection on the other
+                   side of the tracks starts it at the same moment. */
+                rts_log("%s all red %.1f s longer, clearing green starts "
+                        "with the other side of the crossing", s->cfg->label,
+                        (double)(due - now) / 1e9 * rts_speed());
+                rts_timer_once(tmr_phase, (due - now + 999999ULL) / 1000000ULL);
+                return;
+            }
             fsm_enter(s, ST_PRE_CLEAR, "RAIL: clearing the tracks");
             return;
         }
@@ -773,6 +804,7 @@ static void fsm_reevaluate(ictl_t *s)
 
     if (want_hold && !s->hold_rail && !s->pre_pending && !s->pre_done) {
         s->pre_pending = 1;
+        s->pre_ns      = rts_now_ns();
         rts_log("%s pre-emption requested, crossing %s",
                 s->cfg->label, rts_xing_name((uint8_t)s->xing_state));
 

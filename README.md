@@ -82,10 +82,12 @@ rts_traffic/
     inter_panel.c              VM2, the screen and the keys beside the six
     railway.c                  VM3
   scripts/
+    rts_tile.bat               double-click on Windows: start all three nodes in three windows, real time
+    rts_tile_s5.bat            the same at the demonstration speed (-s 5)
+    rts_stop.bat               stop every RTS process on all three nodes
     start_qnet.sh              bring Qnet up on a target
-    run_vm1.sh  run_vm2.sh  run_vm3.sh
+    run_vm1.sh  run_vm3.sh     VM1 central, VM3 railway
     run_vm2_panel.sh           VM2 with its panel, which reads the six's output from a FIFO
-    deploy.ps1                 build on Windows and scp to all three VMs
     deploy_via_vm1.sh          push a build from VM1 to VM2 and VM3 over Qnet, when only VM1 takes key login
 ```
 
@@ -352,24 +354,24 @@ Set `RTS_COLOR=0` on the target if you want to capture plain text.
 
 ## 10. Deploy and run
 
-```powershell
-.\scripts\deploy.ps1 -VM1 192.168.56.110 -VM2 192.168.56.111 -VM3 192.168.56.112
-```
-
-Only VM1 accepts key login. When `deploy.ps1` cannot reach VM2 or VM3, push
-the build through VM1 instead: `deploy_via_vm1.sh` runs on VM1, keeps the
-binaries it replaces in `bak_<tag>` on every node and copies the new ones
-over Qnet. Stop the system first (`.\scriptsts_stop.ps1`); a running binary
-cannot be overwritten.
+Only VM1 accepts key login, so a build reaches VM2 and VM3 through VM1:
+`deploy_via_vm1.sh` runs on VM1, keeps the binaries it replaces in `bak_<tag>`
+on every node and copies the new ones over Qnet. Stop the system first
+(`scripts\rts_stop.bat`); a running binary cannot be overwritten.
 
 ```powershell
 ssh root@192.168.56.110 mkdir -p /tmp/manh/new
-scp bin\* scripts\deploy_via_vm1.sh scriptsun_vm2*.sh root@192.168.56.110:/tmp/manh/new/
+scp bin\* scripts\deploy_via_vm1.sh scripts\run_vm2_panel.sh root@192.168.56.110:/tmp/manh/new/
 ssh root@192.168.56.110 sh /tmp/manh/new/deploy_via_vm1.sh my_tag
 ```
 
-Start in this order — VM3 first so the intersections learn the crossing state
-straight away, VM1 last:
+On Windows, double-click `scripts\rts_tile_s5.bat` to start all three nodes at
+the demonstration speed (`-s 5`, an 18 s cycle), or `scripts\rts_tile.bat` for
+real time; `scripts\rts_stop.bat` stops everything. Both open one window per
+node through VM1 and start them in the order below.
+
+By hand, start in this order — VM3 first so the intersections learn the
+crossing state straight away, VM1 last:
 
 ```sh
 # VM3
@@ -418,7 +420,7 @@ central's table like any other lamp change.
 
 The SELECT row shows an intersection in red when it did not answer the last
 press. There is no `q`: the panel stops with the rest of VM2
-(`./run_vm2.sh stop`), and if it stops on its own the six carry on without a
+(`scripts\rts_stop.bat`), and if it stops on its own the six carry on without a
 picture.
 
 ### Keys — railway (VM3)
@@ -441,7 +443,7 @@ Run at `-s 5`. Each scenario is one claim you can be asked to back up.
 |---|---|---|---|---|
 | 1 | Safe sequence | Straight after start (every intersection starts on FIXED), or central `0` then `f`; watch any intersection for two cycles | A → B → C → D, every green followed by 4 s amber then 2 s all-red. No two phase groups ever green together. | Pass |
 | 2 | Distributed | `pidin` on VM2 shows the six controllers (and `inter_panel`); central shows all six | Six independent controller processes on one node, three nodes joined by Qnet | Pass |
-| 3 | Railway pre-emption | Railway `a` (a train enters at X1) | I1 and I2 cut the current green, run amber + all-red in full, then a clearing green for the movement that comes out of the rail-side arm only (`EW` at I1). Central shows `RAIL HOLD`. The same train reaches X2 60 s later (I3, I4) and X3 90 s after that (I5, I6). | Pass |
+| 3 | Railway pre-emption | Railway `a` (a train enters at X1) | I1 and I2 cut the current green, run amber + all-red in full, then a clearing green for the movement that comes out of the rail-side arm only (`EW` at I1). Both start that clearing green 6 s after the warning, the one already in amber or all-red waiting all red until then. The clearing green is 21 s on every pattern, so I1 and I2 show `RAIL HOLD` on central together even when one runs FIXED and the other SENSOR. The same train reaches X2 60 s later (I3, I4) and X3 90 s after that (I5, I6). | Pass |
 | 4 | Two trains | Railway `b`, then `a` 30 s later | They meet at X2, one on each track: its gates stay down while either track is occupied and only rise when both are clear | HD |
 | 5 | Off peak holds, any phase next | Central `s`, `r` (random cars off), then `$` on the VM2 panel | The intersection goes straight to phase D, whatever phase it was on, and then stays on D indefinitely: nothing asks, so nothing changes. | Credit |
 | 6 | Pedestrians first | Still with random cars off, press `P`, `@`, `p` quickly on the VM2 panel | A for the east pedestrian, held 18 s, then C for the north one, 18 s, and only then B for the car that asked before them. The crossings walk with their phase and flash through its amber. | Credit |
